@@ -8,7 +8,10 @@ gradio
 faiss-cpu
 pandas
 llama-index-llms-openrouter
+llama-index-llms-nvidia
 llama-index-embeddings-huggingface
+llama-index-vector-stores-postgres
+psycopg2-binary
 python-docx
 openpyxl
 markdown
@@ -17,3 +20,5 @@ uvicorn
 python-dotenv
 pydantic
 python-multipart
+sqlalchemy
+pgvector

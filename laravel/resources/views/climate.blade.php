@@ -1,4 +1,4 @@
-@extends('layouts.app')
+@extends('layouts.app2')
 
 @section('title', 'Система адаптации к климатическим рискам')
 
@@ -13,8 +13,8 @@
                             <img class="aside_img" src="{{ asset('icons/arrow.png') }}" alt="Скрыть" />
 
                             <div>
-                                <img class="aside_img" src="{{ asset('icons/bin.png') }}" alt="Корзина" />
-                                <img class="aside_img ms-2" src="{{ asset('icons/chat.png') }}" alt="Новый чат" />
+                                <img class="aside_img bin-icon" src="{{ asset('icons/bin.png') }}" alt="Корзина" style="cursor: pointer;" title="Режим удаления" />
+                                <img class="aside_img ms-2 new-chat-btn" src="{{ asset('icons/chat.png') }}" alt="Новый чат" style="cursor: pointer;" title="Новый чат" />
                             </div>
                         </div>
 
@@ -68,7 +68,31 @@
                     </a>
                     <div class="d-flex justify-content-center align-items-center gap-3">
                         <img class="header_img" src="{{ asset('icons/menu.png') }}" alt="Меню" />
-                        <img class="header_img" src="{{ asset('icons/account.png') }}" alt="Личный кабинет" />
+
+                        <!-- Выпадающее меню профиля -->
+                        <div class="dropdown">
+                            <a style="color: black;" href="#" class="d-flex align-items-center dropdown-toggle" id="userProfileDropdown" role="button" data-bs-toggle="dropdown" aria-expanded="false">
+                                <img class="header_img" src="{{ asset('icons/account.png') }}" alt="Личный кабинет" />
+                            </a>
+
+                            <ul class="dropdown-menu dropdown-menu-end shadow-sm" aria-labelledby="userProfileDropdown">
+                                <li class="px-3 py-2">
+                                    <span class="text-muted small">Здравствуйте,</span>
+                                    <div class="fw-bold text-dark">{{ auth()->user()->name ?? 'Пользователь' }}</div>
+                                </li>
+                                <li><hr class="dropdown-divider m-0"></li>
+                                <li>
+                                    <form id="logout-form" action="{{ route('logout') }}" method="POST" class="d-none">
+                                        @csrf
+                                    </form>
+                                    <a href="#"
+                                       onclick="event.preventDefault(); document.getElementById('logout-form').submit();"
+                                       class="dropdown-item text-danger fw-medium">
+                                        <i class="fas fa-sign-out-alt me-2"></i>Выйти
+                                    </a>
+                                </li>
+                            </ul>
+                        </div>
                     </div>
                 </header>
 

@@ -1,9 +1,10 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from llama_index.llms.openrouter import OpenRouter
+from llama_index.llms.nvidia import NVIDIA
 from llama_index.core.llms import ChatMessage
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.core import Settings, StorageContext, load_index_from_storage
+from llama_index.core import Settings, VectorStoreIndex
+from llama_index.vector_stores.postgres import PGVectorStore
 from llama_index.core.agent.workflow import FunctionAgent
 from fastapi.middleware.cors import CORSMiddleware
 import nest_asyncio
@@ -13,18 +14,25 @@ import os
 load_dotenv()
 nest_asyncio.apply()
 
+# Инициализация моделей
 embed_model = HuggingFaceEmbedding(model_name='intfloat/multilingual-e5-large-instruct')
 Settings.embed_model = embed_model
-Settings.llm = OpenRouter(
-    api_key=os.getenv("OPENROUTER_API_KEY"),
-    model="deepseek/deepseek-r1-0528-qwen3-8b:free",
-
-    max_tokens=10000,
-    context_window=20000,
+Settings.llm = NVIDIA(
+    model="deepseek-ai/deepseek-r1",
+    api_key=os.getenv("NVIDIA_API_KEY"),
+    max_tokens=8000,
 )
 
-STORAGE_PATH = "./storage"
-
+# Параметры подключения к PostgreSQL
+DB_CONFIG = {
+    "database": "climate",
+    "host": "127.0.0.1",
+    "password": "password",
+    "port": 5433,
+    "user": "postgres",
+    "table_name": "climate_embeddings",
+    "embed_dim": 1024,
+}
 RAG_SYSTEM_PROMPT = """
 Ты — эксперт по адаптации к изменениям климата.
 У тебя есть база знаний с кейсами и нормативными документами.
@@ -48,7 +56,7 @@ RAG_SYSTEM_PROMPT = """
 |---------------------------|----------------------|----------------------|------------------------------------|----------------------------|
 | Развитие городского электротранспорта | снижение эмиссии | повышение устойчивости транспортной инфраструктуры | актуально | городские власти |
 | Перевод транспорта на газомоторное топливо | снижение эмиссии | рациональное использование ресурсов | реализуется частично | транспортные организации |
-**Опорные источники:** [1] Наименовавание мероприятий - https://example.com/case_12
+**Опорные источники:** [1] Наименовавание мероприятий - https://example.com/case_12 
 Приводи только те источники, которые используешь для формирования таблицы непосредственно. URL приводи строго такое же, как указано в базе знаний. Наименование мероприятий бери из базы знаний
 Ответственную организацию в таблице указывай актуальную для региона, который пользователь указал в запросе
 """
@@ -91,13 +99,35 @@ CLASSIFIER_SYSTEM_PROMPT = """
 """
 
 
+
+def get_vector_store():
+    return PGVectorStore.from_params(
+        **DB_CONFIG,
+        hnsw_kwargs={
+            "hnsw_m": 16,
+            "hnsw_ef_construction": 64,
+            "hnsw_ef_search": 40,
+            "hnsw_dist_method": "vector_cosine_ops",
+        },
+    )
+
+
+def load_vector_index():
+    try:
+        vector_store = get_vector_store()
+        index = VectorStoreIndex.from_vector_store(vector_store=vector_store)
+        return index
+    except Exception as e:
+        print(f"Ошибка загрузки индекса: {e}")
+        return None
+
+
 def classify_query_tool(user_question: str) -> str:
     try:
         messages = [
             ChatMessage(role="system", content=CLASSIFIER_SYSTEM_PROMPT),
             ChatMessage(role="user", content=user_question)
         ]
-
         response = Settings.llm.chat(messages)
         query_type = response.message.content.strip().lower()
         return query_type if query_type in ["rag", "dialog"] else "dialog"
@@ -108,8 +138,10 @@ def classify_query_tool(user_question: str) -> str:
 
 def retrieve_rag_context(user_question: str) -> str:
     try:
-        storage_context = StorageContext.from_defaults(persist_dir=STORAGE_PATH)
-        index = load_index_from_storage(storage_context)
+        index = load_vector_index()
+        if index is None:
+            return "Ошибка: векторный индекс не загружен"
+
         retriever = index.as_retriever(similarity_top_k=4)
         nodes = retriever.retrieve(user_question)
 
@@ -122,7 +154,7 @@ def retrieve_rag_context(user_question: str) -> str:
 def generate_rag_response(user_question: str, context: str) -> str:
     try:
         full_system_prompt = RAG_SYSTEM_PROMPT + f"\n\nКонтекст:\n{context}"
-
+        print(full_system_prompt)
         messages = [
             ChatMessage(role="system", content=full_system_prompt),
             ChatMessage(role="user", content="Пользовательский запрос: " + user_question)
@@ -147,6 +179,7 @@ def generate_dialog_response(user_question: str) -> str:
         return f"Ошибка диалогового агента: {str(e)}"
 
 
+# Агенты остаются без изменений
 classifier_agent = FunctionAgent(
     name="ClassifierAgent",
     description="Классифицирует запросы пользователя на RAG или диалоговые",

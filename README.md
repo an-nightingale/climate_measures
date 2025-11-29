@@ -22,3 +22,4 @@ composer install
 php artisan serve
 ```
 
+### Создать базу данных на порту 5433 под названием climate
