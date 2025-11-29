@@ -22,5 +22,14 @@ python main.py
 ```bash
 cd laravel
 composer install
+php artisan migrate
+php artisan tinker
+use App\Models\User;
+User::create([
+    'name' => 'имя',
+    'email' => 'почта',
+    'password' => bcrypt('пароль')
+]);
+exit
 php artisan serve
 ```
