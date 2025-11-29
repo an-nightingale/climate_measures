@@ -6,12 +6,15 @@
 
 ## Запуск
 
+### Создать базу данных postgres на порту 5433 под названием "climate"
+
 ### Python RAG
 ```bash
 cd python
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
+python createvector.py
 python main.py
 ```
 
@@ -21,5 +24,3 @@ cd laravel
 composer install
 php artisan serve
 ```
-
-### Создать базу данных на порту 5433 под названием climate
