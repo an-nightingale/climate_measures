@@ -8,6 +8,7 @@ use Illuminate\Support\Facades\Log;
 use App\Models\Conversation;
 use App\Models\Message;
 use Illuminate\Support\Str;
+use Illuminate\Support\Facades\Storage;
 
 class ClimateController extends Controller
 {
@@ -20,10 +21,17 @@ class ClimateController extends Controller
 
     /**
      * Показать интерфейс системы
+     *
+     * @return \Illuminate\Contracts\View\View|\Illuminate\Http\RedirectResponse
      */
     public function showInterface()
     {
-        // Получаем последние диалоги пользователя
+        // Если пользователь администратор - перенаправляем в админ-панель
+        if (auth()->user()->role === 'admin') {
+            return redirect()->route('admin.climate');
+        }
+
+        // Обычный пользователь
         $conversations = auth()->user()->conversations()
             ->orderBy('last_interaction_at', 'desc')
             ->take(10)
@@ -64,9 +72,6 @@ class ClimateController extends Controller
         ]);
     }
 
-    /**
-     * Обработать запрос пользователя с сохранением пары
-     */
     /**
      * Обработать запрос пользователя с сохранением в БД и контекстом
      */
@@ -229,5 +234,106 @@ class ClimateController extends Controller
         $conversation->delete();
 
         return response()->json(['success' => true]);
+    }
+
+    /**
+     * Одобрить мероприятие
+     */
+    public function approveMeasure(Request $request)
+    {
+        $request->validate([
+            'measure.name' => 'required|string',
+            'measure.mitigation' => 'nullable|string',
+            'measure.adaptation' => 'required|string',
+            'measure.relevance' => 'required|string',
+            'measure.responsible' => 'required|string',
+            'source_question' => 'nullable|string',
+        ]);
+
+        $response = Http::timeout(10)
+            ->post($this->apiBaseUrl . '/approve-measure', $request->measure);
+
+        if ($response->successful()) {
+            return response()->json(['success' => true]);
+        } else {
+            \Log::error('Ошибка при одобрении меры', $response->json());
+            return response()->json(['success' => false, 'error' => 'Не удалось сохранить'], 500);
+        }
+    }
+
+    /**
+     * Прокси-экспорт в DOCX (через Python API)
+     */
+    public function exportDocx(Request $request)
+    {
+        try {
+            $response = Http::timeout(60)
+                ->withHeaders([
+                    'Content-Type' => 'application/json',
+                    'Accept' => 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                ])
+                ->post($this->apiBaseUrl . '/export/docx', [
+                    'content' => $request->input('content'),
+                    'filename' => $request->input('filename', 'export.docx')
+                ]);
+
+            if ($response->successful()) {
+                return response($response->body(), 200)
+                    ->header('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+                    ->header('Content-Disposition', 'attachment; filename="' .
+                        ($request->input('filename') ?? 'export_' . time() . '.docx') . '"');
+            }
+
+            $error = $response->json();
+            return response()->json([
+                'success' => false,
+                'error' => $error['detail'] ?? 'Ошибка генерации файла'
+            ], $response->status() ?: 500);
+
+        } catch (\Exception $e) {
+            Log::error('DOCX export proxy error', ['message' => $e->getMessage()]);
+            return response()->json([
+                'success' => false,
+                'error' => 'Не удалось сгенерировать DOCX файл'
+            ], 500);
+        }
+    }
+
+    /**
+     * Прокси-экспорт в Excel (через Python API)
+     */
+    public function exportExcel(Request $request)
+    {
+        try {
+            $response = Http::timeout(60)
+                ->withHeaders([
+                    'Content-Type' => 'application/json',
+                    'Accept' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                ])
+                ->post($this->apiBaseUrl . '/export/excel', [
+                    'content' => $request->input('content'),
+                    'filename' => $request->input('filename', 'export.xlsx')
+                ]);
+
+            if ($response->successful()) {
+                return response($response->body(), 200)
+                    ->header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                    ->header('Content-Disposition', 'attachment; filename="' .
+                        ($request->input('filename') ?? 'export_' . time() . '.xlsx') . '"');
+            }
+
+            $error = $response->json();
+            return response()->json([
+                'success' => false,
+                'error' => $error['detail'] ?? 'Ошибка генерации файла'
+            ], $response->status() ?: 500);
+
+        } catch (\Exception $e) {
+            Log::error('Excel export proxy error', ['message' => $e->getMessage()]);
+            return response()->json([
+                'success' => false,
+                'error' => 'Не удалось сгенерировать Excel файл'
+            ], 500);
+        }
     }
 }

@@ -1,38 +1,69 @@
+import threading
+import time
+import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from llama_index.llms.nvidia import NVIDIA
 from llama_index.core.llms import ChatMessage
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.core import Settings, VectorStoreIndex
+from llama_index.core import Settings, VectorStoreIndex, Document, StorageContext
 from llama_index.vector_stores.postgres import PGVectorStore
-from llama_index.core.agent.workflow import FunctionAgent
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import nest_asyncio
 from dotenv import load_dotenv
 import os
+import psycopg2
+import openai
+from docx import Document as DocxDocument
+from docx.shared import Pt
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from io import BytesIO
+import re
+from bs4 import BeautifulSoup
+import openpyxl.styles
+import json
 
 load_dotenv()
 nest_asyncio.apply()
 
-# Инициализация моделей
+# === Глобальное хранилище одобренных мероприятий (в памяти) ===
+APPROVED_MEASURES = []
+_rebuild_lock = threading.Lock()
+TABLE_NAME = "climate_embeddings"
+
+yandex_client = openai.OpenAI(
+    api_key=os.getenv("YANDEX_CLOUD_API_KEY"),
+    base_url="https://ai.api.cloud.yandex.net/v1",
+    project=os.getenv("YANDEX_CLOUD_FOLDER")
+)
+
 embed_model = HuggingFaceEmbedding(model_name='intfloat/multilingual-e5-large-instruct')
 Settings.embed_model = embed_model
 Settings.llm = NVIDIA(
-    model="deepseek-ai/deepseek-r1",
+    model="openai/gpt-oss-120b",
     api_key=os.getenv("NVIDIA_API_KEY"),
     max_tokens=8000,
 )
 
-# Параметры подключения к PostgreSQL
-DB_CONFIG = {
+# === Параметры подключения к PostgreSQL ===
+DB_PARAMS = {
     "database": "climate",
     "host": "127.0.0.1",
     "password": "password",
     "port": 5433,
     "user": "postgres",
-    "table_name": "climate_embeddings",
     "embed_dim": 1024,
 }
+PSYCOPG_DB_PARAMS = {
+    "database": "climate",
+    "host": "127.0.0.1",
+    "password": "password",
+    "port": 5433,
+    "user": "postgres",
+}
+
+# === Промпты ===
 RAG_SYSTEM_PROMPT = """
 Ты — эксперт по адаптации к изменениям климата.
 У тебя есть база знаний с кейсами и нормативными документами.
@@ -50,65 +81,181 @@ RAG_SYSTEM_PROMPT = """
    добавь их **ниже таблицы** в виде списка ссылок:
    `**Опорные источники:** [1] Наименовавание мероприятий - URL, [2] Наименовавание мероприятий - URL`
 3. Пиши кратко, по существу, с акцентом на реальные, практические меры.
-4. Если информация отсутствует — предложи логичные адаптационные меры на основе Приказа Минэкономразвития России от 13 мая 2021 г. № 267 «Об утверждении методических рекомендаций и показателей по вопросам адаптации к изменениям климата».
 Пример формата ответа:
 | Наименование мероприятий | Митигационный эффект | Адаптационный эффект | Актуальность для Тобольского района | Ответственная организация |
 |---------------------------|----------------------|----------------------|------------------------------------|----------------------------|
 | Развитие городского электротранспорта | снижение эмиссии | повышение устойчивости транспортной инфраструктуры | актуально | городские власти |
 | Перевод транспорта на газомоторное топливо | снижение эмиссии | рациональное использование ресурсов | реализуется частично | транспортные организации |
-**Опорные источники:** [1] Наименовавание мероприятий - https://example.com/case_12 
-Приводи только те источники, которые используешь для формирования таблицы непосредственно. URL приводи строго такое же, как указано в базе знаний. Наименование мероприятий бери из базы знаний
+**Опорные источники:** [1] Наименовавание мероприятия 1 - https://example.com/case_1    [2] Наименовавание мероприятия 2 - https://example.com/case_2   
+Приводи те источники, которые используешь для формирования таблицы непосредственно. Источники только из полученного контекста базы знаний, при этом приведи источник соответственно для каждой рекомендуемой тобой меры (сколько строк таблицы, столько и источников). 
+URL в источниках приводи строго такое же, как указано в базе знаний. Наименование мероприятий в источниках бери из базы знаний. В таблице наименования мероприятий формируй без упоминания источников (других кейсов).
 Ответственную организацию в таблице указывай актуальную для региона, который пользователь указал в запросе
 """
 
 DIALOG_SYSTEM_PROMPT = """
-Ты — эксперт по климатическим рискам и адаптации. Отвечай чётко, по делу и на русском языке.
-Если вопрос выходит за рамки темы — кратко ответь на вопрос пользователя, а затем вежливо уточни, что специализируешься на вопросах изменения климата, адаптации и устойчивого развития,
-Попроси пользователя в следующем запросе уточнить проблему, связанную с климатическим риском. Все равно обязательно кратко ответь на вопрос пользователя.
+Ты — экспертный ассистент по вопросам климатических рисков для Тюменской области. Отвечай на вопросы пользователя максимально точно и полезно. Ищи актуальную информацию. После поиска дай пользователю краткий, структурированный ответ, выдели ключевые факты. Если использовал внешние источники - в конце напиши ссылки на страницы, с которых взята информация.
 """
 
 CLASSIFIER_SYSTEM_PROMPT = """
 Ты — классификатор запросов. Твоя задача — определить тип запроса пользователя.
 Доступные типы:
-- "rag" — запросы, требующие поиска в базе знаний, напрямую связанные с климатическими рисками и адаптационными мероприятиями (климатические риски в регионе, мероприятия по адаптации для конкретных регионов)
-- "dialog" — общие вопросы, не требующие поиска в базе знаний
+- "rag" — запросы, требующие поиска в базе знаний, напрямую связанные с адаптационными мероприятиями для конкретных регионов. Могут быть либо прямыми запросами на составление адаптационных мероприятий, либо описанием существующего климатического риска с просьбой составить адаптационные мероприятия или без просьбы.
+- "dialog" — прочие вопросы, не требующие поиска в базе знаний, в том числе общие вопросы про климатические риски.
 
 Примеры классификации:
-Запрос: "Какие меры по адаптации к засухе в Ялуторовском районе?"
+Запрос: "Какие меры по адаптации к засухе для Ялуторовского района?"
 Тип: rag
 
-Запрос: "Климатические риски в Тюменской области"
+Запрос: "Составь таблицу мер по адаптации к аномальной жаре для Ишима"
 Тип: rag
+
+Запрос: "Пожарная опасность в Тобольском районе. Какие адаптационные мероприятия к ней?"
+Тип: rag
+
+Запрос: "Опасность паводков в Заводоуковске"
+Тип: rag
+
+Запрос: "Какие есть климатические риски в Тюменской области"
+Тип: dialogue
 
 Запрос: "Кто отвечает за адаптацию в Исетском районе?"
-Тип: rag
+Тип: dialogue
 
-Запрос: "Что такое парниковый эффект?"
-Тип: dialog
-
-Запрос: "Как сократить выбросы CO2 на предприятии?"
+Запрос: "Проведи анализ климатических рисков для Аббатского района, связанных с засухой"
 Тип: dialog
 
 Запрос: "Расскажи про адаптацию в Норвегии"
-Тип: dialog
-
-Запрос: "Какие существуют виды возобновляемой энергии?"
 Тип: dialog
 
 Отвечай ТОЛЬКО одним словом: "rag" или "dialog". Не добавляй никаких пояснений.
 """
 
 
+# === Утилиты для работы с Excel ===
+def read_excel_as_documents(file_path: str):
+    df = pd.read_excel(file_path)
+    docs = []
+    for i, row in df.iterrows():
+        text = "\n".join([f"{col}: {row[col]}" for col in df.columns if pd.notna(row[col])])
+        docs.append(Document(
+            text=text,
+            metadata={
+                "source": os.path.basename(file_path),
+                "row_index": i,
+                "file_type": "excel"
+            }
+        ))
+    return docs
 
+
+def process_excel_files(data_path: str):
+    all_docs = []
+    for file_name in os.listdir(data_path):
+        if file_name.endswith(('.xlsx', '.xls')):
+            file_path = os.path.join(data_path, file_name)
+            print(f"Обработка Excel файла: {file_name}")
+            try:
+                excel_docs = read_excel_as_documents(file_path)
+                all_docs.extend(excel_docs)
+                print(f"  - Получено {len(excel_docs)} документов")
+            except Exception as e:
+                print(f"  - Ошибка обработки {file_name}: {e}")
+    return all_docs
+
+
+# === Преобразование APPROVED_MEASURES в документы ===
+def get_approved_documents():
+    docs = []
+    for i, item in enumerate(APPROVED_MEASURES):
+        text = "\n".join([
+            f"Наименование мероприятий: {item.get('name', '')}",
+            f"Митигационный эффект: {item.get('mitigation', '')}",
+            f"Адаптационный эффект: {item.get('adaptation', '')}",
+            f"Актуальность для региона: {item.get('relevance', '')}",
+            f"Ответственная организация: {item.get('responsible', '')}",
+            f"Исходный запрос: {item.get('source_question', '')}"
+        ])
+        docs.append(Document(
+            text=text,
+            metadata={
+                "source": "user_approved_in_memory",
+                "row_index": i,
+                "file_type": "user_approved"
+            }
+        ))
+    return docs
+
+
+# === Фоновый ребилд индекса (БЕЗ ПРОСТОЯ) ===
+def background_rebuild_index():
+    if _rebuild_lock.locked():
+        print("🔁 Ребилд уже запущен")
+        return
+
+    with _rebuild_lock:
+        print("🔄 Запуск фонового ребилда...")
+
+        # Имя новой таблицы
+        temp_table = f"climate_embeddings_new_{int(time.time())}"
+        active_table = TABLE_NAME
+        backup_table = f"climate_embeddings_old_{int(time.time())}"
+
+        try:
+            # 1. Создаём новую таблицу и наполняем данными
+            temp_store = PGVectorStore.from_params(
+                table_name=temp_table,
+                hnsw_kwargs={
+                    "hnsw_m": 16,
+                    "hnsw_ef_construction": 64,
+                    "hnsw_ef_search": 40,
+                    "hnsw_dist_method": "vector_cosine_ops",
+                },
+                **DB_PARAMS
+            )
+
+            # 2. Собираем документы
+            all_docs = []
+            all_docs.extend(process_excel_files("./data"))
+            all_docs.extend(get_approved_documents())
+
+            if not all_docs:
+                raise ValueError("Нет документов для индексации")
+
+            # 3. Создаём индекс в новой таблице
+            storage_context = StorageContext.from_defaults(vector_store=temp_store)
+            VectorStoreIndex(
+                nodes=all_docs,
+                storage_context=storage_context,
+                show_progress=True
+            )
+            print(f"  → Новая таблица {temp_table} готова")
+
+            # 4. АТОМАРНО ПЕРЕКЛЮЧАЕМ ТАБЛИЦЫ
+            conn = psycopg2.connect(dbname="climate", user="postgres", password="password", host="127.0.0.1", port=5433)
+            cur = conn.cursor()
+            cur.execute(f"ALTER TABLE IF EXISTS data_{active_table} RENAME TO {backup_table};")
+            cur.execute(f"ALTER TABLE {temp_table} RENAME TO data_{active_table};")
+            conn.commit()
+            cur.close()
+            conn.close()
+
+            print(f"✅ Ребилд завершён. Старая таблица: {backup_table}")
+
+        except Exception as e:
+            print("❌ Ошибка ребилда:", e)
+
+
+# === Загрузка индекса (для RAG) ===
 def get_vector_store():
     return PGVectorStore.from_params(
-        **DB_CONFIG,
+        table_name=TABLE_NAME,
         hnsw_kwargs={
             "hnsw_m": 16,
             "hnsw_ef_construction": 64,
             "hnsw_ef_search": 40,
             "hnsw_dist_method": "vector_cosine_ops",
         },
+        **DB_PARAMS
     )
 
 
@@ -122,6 +269,41 @@ def load_vector_index():
         return None
 
 
+# === Модифицированная функция диалогового агента с Яндекс GPT ===
+def generate_dialog_response(user_question: str) -> str:
+    try:
+        full_prompt = f"""{DIALOG_SYSTEM_PROMPT}
+        Запрос пользователя: {user_question}
+        Пожалуйста, предоставь ответ на основе актуальных данных из интернета."""
+        response = yandex_client.responses.create(
+            model=f"gpt://{os.getenv('YANDEX_CLOUD_FOLDER')}/{os.getenv('YANDEX_CLOUD_MODEL')}",
+            input=full_prompt,
+            tools=[
+                {
+                    "type": "web_search",
+                    "filters": {
+                        "allowed_domains": [],
+                        "user_location": {
+                            "region": "225",
+                        }
+                    },
+                    "search_context_size": "medium",
+                }
+            ],
+            temperature=0.5,
+            max_output_tokens=2000
+        )
+        if hasattr(response, 'output_text') and response.output_text:
+            return response.output_text
+        else:
+            return f"Не удалось получить ответ от Яндекс GPT. Пожалуйста, попробуйте еще раз."
+
+    except Exception as e:
+        print(f"Ошибка диалогового агента Яндекс GPT: {e}")
+        return f"Ошибка при обработке запроса: {str(e)}"
+
+
+# === Классификатор и RAG функции ===
 def classify_query_tool(user_question: str) -> str:
     try:
         messages = [
@@ -141,10 +323,8 @@ def retrieve_rag_context(user_question: str) -> str:
         index = load_vector_index()
         if index is None:
             return "Ошибка: векторный индекс не загружен"
-
         retriever = index.as_retriever(similarity_top_k=4)
         nodes = retriever.retrieve(user_question)
-
         context = "\n\n".join([node.get_content() for node in nodes]) if nodes else "Не найдено релевантных документов."
         return context
     except Exception as e:
@@ -159,62 +339,17 @@ def generate_rag_response(user_question: str, context: str) -> str:
             ChatMessage(role="system", content=full_system_prompt),
             ChatMessage(role="user", content="Пользовательский запрос: " + user_question)
         ]
-
         response = Settings.llm.chat(messages)
         return response.message.content
     except Exception as e:
-        return f"Ошибка генерации RAG ответа: {str(e)}"
-
-
-def generate_dialog_response(user_question: str) -> str:
-    try:
-        messages = [
-            ChatMessage(role="system", content=DIALOG_SYSTEM_PROMPT),
-            ChatMessage(role="user", content=user_question)
-        ]
-
-        response = Settings.llm.chat(messages)
-        return response.message.content
-    except Exception as e:
-        return f"Ошибка диалогового агента: {str(e)}"
-
-
-# Агенты остаются без изменений
-classifier_agent = FunctionAgent(
-    name="ClassifierAgent",
-    description="Классифицирует запросы пользователя на RAG или диалоговые",
-    system_prompt="Ты - классификатор запросов. Определяешь тип запроса и передаешь соответствующему агенту.",
-    llm=Settings.llm,
-    tools=[classify_query_tool],
-    can_handoff_to=["RAGAgent", "DialogAgent"],
-)
-
-rag_agent = FunctionAgent(
-    name="RAGAgent",
-    description="Обрабатывает запросы, требующие поиска в базе знаний",
-    system_prompt=RAG_SYSTEM_PROMPT,
-    llm=Settings.llm,
-    tools=[retrieve_rag_context, generate_rag_response],
-    can_handoff_to=["ClassifierAgent"],
-)
-
-dialog_agent = FunctionAgent(
-    name="DialogAgent",
-    description="Обрабатывает общие диалоговые запросы по климатической тематике",
-    system_prompt=DIALOG_SYSTEM_PROMPT,
-    llm=Settings.llm,
-    tools=[generate_dialog_response],
-    can_handoff_to=["ClassifierAgent"],
-)
+        return f"Ошибка генерации ответа: {str(e)}"
 
 
 def process_query_simple(user_question: str) -> str:
     if not user_question.strip():
         return "Ошибка: пожалуйста, введите ваш запрос."
-
     query_type = classify_query_tool(user_question)
     print(f"Определен тип запроса: {query_type}")
-
     if query_type == "rag":
         context = retrieve_rag_context(user_question)
         return generate_rag_response(user_question, context)
@@ -222,9 +357,169 @@ def process_query_simple(user_question: str) -> str:
         return generate_dialog_response(user_question)
 
 
+# === Утилиты для экспорта ===
+def parse_html_table(html: str):
+    """Преобразует HTML-таблицу в список списков + извлекает источники БЕЗ дублирования"""
+    soup = BeautifulSoup(html, 'html.parser')
+    tables = soup.find_all('table')
+
+    result = []
+    for table in tables:
+        table_data = []
+        # Заголовки
+        header_row = table.find('thead')
+        if header_row:
+            headers = [th.get_text(strip=True) for th in header_row.find_all('th')]
+            if headers:
+                table_data.append(headers)
+        # Тело таблицы
+        tbody = table.find('tbody') or table
+        for row in tbody.find_all('tr'):
+            cells = [td.get_text(strip=True) for td in row.find_all(['td', 'th'])]
+            if cells and any(cells):
+                table_data.append(cells)
+        if table:
+            result.append(table_data)
+
+    # === ИЗВЛЕЧЕНИЕ ИСТОЧНИКОВ: только один раз, без дублирования ===
+    sources_text = ""
+
+    # Ищем контейнер с ответом
+    markdown_div = soup.find(class_='markdown-content') or soup
+
+    # Находим последнюю таблицу
+    all_tables = markdown_div.find_all('table')
+    if not all_tables:
+        return result, ""
+
+    last_table = all_tables[-1]
+
+    # Собираем ВСЁ текстовое содержимое ПОСЛЕ последней таблицы
+    after_parts = []
+    found_last_table = False
+
+    # Проходим по всем элементам в порядке DOM
+    for elem in markdown_div.find_all(string=True):  # текстовые узлы
+        parent = elem.parent
+        # Проверяем, является ли родитель частью последней таблицы
+        if parent == last_table or parent.find_parent('table') == last_table:
+            found_last_table = True
+            continue
+        # Если уже прошли таблицу — собираем текст
+        if found_last_table:
+            text = elem.strip()
+            if text and text not in after_parts:  # избегаем дубликатов
+                after_parts.append(text)
+
+    if after_parts:
+        # Собираем в строку, фильтруя пустые и дубли
+        seen = set()
+        unique_lines = []
+        for line in after_parts:
+            line_clean = line.strip()
+            if line_clean and line_clean not in seen:
+                seen.add(line_clean)
+                unique_lines.append(line_clean)
+        sources_text = '\n'.join(unique_lines)
+
+    return result, sources_text.strip()
+
+
+def _add_sources_to_docx(doc, sources_text: str):
+    """Добавляет источники в DOCX как обычный текст (без маркеров списка), URL подчёркнут"""
+    if not sources_text or not sources_text.strip():
+        return
+
+    # Пустая строка перед блоком источников
+    doc.add_paragraph()
+
+    lines = sources_text.strip().split('\n')
+    header_added = False
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        # === ОБРАБОТКА ЗАГОЛОВКА "Опорные источники" ===
+        if 'опорные источники' in line.lower():
+            if not header_added:
+                doc.add_heading('Опорные источники:', level=3)
+                header_added = True
+            # Извлекаем остаток строки после заголовка
+            rest = re.sub(r'опорные источники[:\s]*', '', line, flags=re.IGNORECASE).strip()
+            if not rest:
+                continue  # только заголовок, переходим к следующей строке
+            line = rest  # обрабатываем остаток как обычный текст
+
+        # === ОБЫЧНЫЙ ПАРАГРАФ (без маркера списка!) ===
+        p = doc.add_paragraph()  # <--- УБРАНО: style='List Bullet'
+
+        # === ОБРАБОТКА URL: делаем подчёркнутым, НЕ дублируя ===
+        url_match = re.search(r'(https?://[^\s\]\[•\n]+)', line)
+
+        if url_match:
+            url = url_match.group(1)
+            parts = line.split(url)
+            # Текст до URL
+            if parts[0].strip():
+                p.add_run(parts[0].strip())
+            # URL подчёркнутый
+            url_run = p.add_run(url)
+            url_run.font.underline = True
+            # Текст после URL (если есть)
+            if len(parts) > 1 and parts[1].strip():
+                p.add_run(parts[1].strip())
+        else:
+            # Нет URL — добавляем весь текст как есть
+            p.add_run(line)
+
+
+def _add_sources_to_excel(worksheet, sources_text: str, start_row: int):
+    """Добавляет источники в Excel: одна строка = одна ячейка, без дублирования"""
+    if not sources_text or not sources_text.strip():
+        return start_row
+
+    lines = sources_text.strip().split('\n')
+    header_added = False
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        # Заголовок — только один раз
+        if 'опорные источники' in line.lower() and not header_added:
+            worksheet.cell(row=start_row, column=1, value="Опорные источники:")
+            worksheet.cell(row=start_row, column=1).font = openpyxl.styles.Font(bold=True)
+            start_row += 1
+            header_added = True
+            # Если в строке есть ещё текст после заголовка — обрабатываем
+            rest = re.sub(r'опорные источники[:\s]*', '', line, flags=re.IGNORECASE).strip()
+            if rest:
+                line = rest
+            else:
+                continue
+
+        # Добавляем строку источника
+        cell = worksheet.cell(row=start_row, column=1, value=line)
+        start_row += 1
+
+        # Если в строке есть URL — добавляем гиперссылку
+        url_match = re.search(r'(https?://[^\s]+)', line)
+        if url_match:
+            try:
+                cell.hyperlink = url_match.group(1)
+                cell.style = "Hyperlink"
+            except Exception:
+                pass  # openpyxl может не поддерживать все гиперссылки
+
+    return start_row
+
+
+# === FastAPI ===
 app = FastAPI(title="Climate Adaptation API")
 
-# CORS для Laravel
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"],
@@ -241,6 +536,29 @@ class QuestionRequest(BaseModel):
 class QuestionResponse(BaseModel):
     answer: str
     status: str
+
+
+class ApprovedMeasure(BaseModel):
+    name: str
+    mitigation: str | None = None
+    adaptation: str
+    relevance: str
+    responsible: str
+    source_question: str | None = None
+
+
+class ExportRequest(BaseModel):
+    content: str
+    filename: str
+
+
+class GenerateSQLRequest(BaseModel):
+    prompt: str
+    table_name: str = "climate_cases"
+
+
+class StructuredDataRequest(BaseModel):
+    prompt: str
 
 
 @app.get("/")
@@ -260,6 +578,276 @@ async def ask_question_simple(request: QuestionRequest):
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
+
+
+# === Одобрение + авто-ребилд ===
+@app.post("/approve-measure")
+async def approve_measure(measure: ApprovedMeasure):
+    global APPROVED_MEASURES
+    APPROVED_MEASURES.append(measure.dict())
+    print(f"✅ Одобрено мероприятие: {measure.name}")
+
+    # Запускаем ребилд в фоне (не блокируя ответ)
+    threading.Thread(target=background_rebuild_index, daemon=True).start()
+
+    return {"success": True, "message": "Добавлено. Ребилд запущен в фоне."}
+
+
+# === (Опционально) ручной ребилд ===
+@app.post("/rebuild-index")
+async def manual_rebuild():
+    threading.Thread(target=background_rebuild_index, daemon=True).start()
+    return {"status": "started", "message": "Ребилд запущен в фоне"}
+
+
+# === Экспорт в DOCX ===
+@app.post("/export/docx")
+async def export_docx(request: ExportRequest):
+    try:
+        tables, sources_text = parse_html_table(request.content)
+        if not tables:
+            raise HTTPException(status_code=400, detail="No tables found in content")
+
+        doc = DocxDocument()
+        doc.add_heading('Экспорт адаптационных мероприятий', level=1)
+
+        for idx, table_data in enumerate(tables, 1):
+            if idx > 1:
+                doc.add_page_break()
+
+            if len(table_data) < 2:
+                continue
+
+            # Создаём таблицу
+            rows, cols = len(table_data), len(table_data[0])
+            word_table = doc.add_table(rows=rows, cols=cols)
+            word_table.style = 'Table Grid'
+
+            # Заполняем данными
+            for i, row_data in enumerate(table_data):
+                for j, cell_text in enumerate(row_data[:cols]):
+                    cell = word_table.cell(i, j)
+                    cell.text = cell_text
+                    if i == 0:  # заголовки
+                        for paragraph in cell.paragraphs:
+                            for run in paragraph.runs:
+                                run.font.bold = True
+                                run.font.size = Pt(10)
+                    else:
+                        for paragraph in cell.paragraphs:
+                            for run in paragraph.runs:
+                                run.font.size = Pt(9)
+
+            # Добавляем источники после каждой таблицы (сохраняя исходное форматирование)
+            _add_sources_to_docx(doc, sources_text)
+
+        # Сохраняем в буфер
+        buffer = BytesIO()
+        doc.save(buffer)
+        buffer.seek(0)
+
+        filename = request.filename if request.filename.endswith('.docx') else f"{request.filename}.docx"
+
+        return StreamingResponse(
+            buffer,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"DOCX export error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Export error: {str(e)}")
+
+
+# === Экспорт в Excel ===
+@app.post("/export/excel")
+async def export_excel(request: ExportRequest):
+    try:
+        tables, sources_text = parse_html_table(request.content)
+        if not tables:
+            raise HTTPException(status_code=400, detail="No tables found in content")
+
+        buffer = BytesIO()
+        sheet_created = False
+
+        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+            for idx, table_data in enumerate(tables, 1):
+                if len(table_data) < 2:
+                    continue
+
+                # === ИСПРАВЛЕНИЕ: согласуем количество колонок ===
+                headers = table_data[0]
+                num_cols = len(headers)
+
+                # Обрезаем каждую строку данных до количества колонок в заголовке
+                cleaned_rows = []
+                for row in table_data[1:]:
+                    if len(row) >= num_cols:
+                        cleaned_rows.append(row[:num_cols])
+                    elif len(row) > 0:
+                        # Если строк меньше, дополняем пустыми
+                        padded = row + [''] * (num_cols - len(row))
+                        cleaned_rows.append(padded)
+
+                if not cleaned_rows:
+                    continue
+
+                # Создаём DataFrame с согласованными колонками
+                df = pd.DataFrame(cleaned_rows, columns=headers)
+
+                sheet_name = f'Table_{idx}'[:31]  # Excel limit: 31 char
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+                sheet_created = True
+
+                # Форматирование
+                worksheet = writer.sheets[sheet_name]
+                # Жирные заголовки
+                for cell in worksheet[1]:
+                    if cell.value:
+                        cell.font = openpyxl.styles.Font(bold=True)
+
+                # Добавляем источники под таблицей
+                if sources_text:
+                    start_row = len(df) + 3  # +1 header +1 empty +1 sources header
+                    start_row = _add_sources_to_excel(worksheet, sources_text, start_row)
+
+            # === ИСПРАВЛЕНИЕ: гарантируем видимость хотя бы одного листа ===
+            if not sheet_created:
+                worksheet = writer.book.create_sheet(title='No_Data')
+                worksheet['A1'] = 'Нет данных для экспорта'
+                worksheet.sheet_state = 'visible'
+            else:
+                # Делаем первый лист активным и видимым
+                if writer.book.worksheets:
+                    writer.book.active = 0
+                    writer.book.worksheets[0].sheet_state = 'visible'
+
+        buffer.seek(0)
+        filename = request.filename if request.filename.endswith('.xlsx') else f"{request.filename}.xlsx"
+
+        return StreamingResponse(
+            buffer,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Excel export error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Export error: {str(e)}")
+
+
+@app.post("/generate-structured-data")
+async def generate_structured_data(request: StructuredDataRequest):
+    try:
+        system_prompt = """
+Ты — эксперт по SQL и климатическим адаптационным мероприятиям.
+Пользователь описывает климатический кейс в свободной форме.
+
+ПРАВИЛА:
+1. Если в описании НЕ указаны хотя бы один из двух ключевых элементов:
+   - Предлагаемые мероприятия/меры
+   - Географическая привязка (регион/район)
+   То верни JSON: {"error": "Не указаны мероприятия или регион"}
+
+2. Если элементы есть, преобразуй описание в JSON структуру для таблицы 'climate_cases'.
+
+ВЕРНИ ТОЛЬКО JSON в таком формате:
+{
+    "problem": "описание проблемы",
+    "measure_name": "мероприятия",
+    "mitigation_effect": "митигационный эффект",
+    "adaptation_effect": "адаптационный эффект", 
+    "district_name": "район",
+    "climate_conditions": "агроклиматические условия района по плану: Среднегодовая температура. Сезонные средние (температура - зима, весна, лето, осень). Количество безморозных дней/период без ночных заморозков. Годовое количество осадков. Средняя влажность. Дождливые сезоны (напр., максимум весной/осенью). Экстремальные явления: есть ли явления и если да, то какие. Почвенные характеристики. Высота над уровнем моря. Климатический пояс. Есть ли водоемы рядом и какие, и есть ли риск затопления.)",
+    "responsible_org": "ответственная организация",
+    "source_url": "URL источника"
+}
+
+Если каких-то данных нет в описании пользователя — сделай реалистичные предположения на основе региона.
+
+ПРИМЕР JSON:
+{
+    "problem": "городской остров тепла, нехватка воды и высокое энергопотребление",
+    "measure_name": "Комплекс «Открытые сады»: создание экологического городского кластера с пассивными зданиями, геотермальной системой, фотоэлектрической станцией, зелёными крышами",
+    "mitigation_effect": "Снижение выбросов CO₂, уменьшение потребления энергии",
+    "adaptation_effect": "Стабилизация температуры, удержание дождевой воды, снижение эффекта городского острова тепла",
+    "district_name": "Брно (Южноморавский край, Чехия)",
+    "climate_conditions": "Среднегодовая температура — 9,7 °C. Зима: –1 °C, весна: 10 °C, лето: 20 °C, осень: 11 °C. Безморозный период — 170 дней. Осадки — 520 мм/год, максимум летом. Влажность — 73%. Почвы — суглинистые. Высота — 246 м. Климат — умеренно континентальный. Рядом река Свратка, риск локальных подтоплений.",
+    "responsible_org": "Чешский фонд экологического партнёрства, муниципалитет Брно",
+    "source_url": "https://www.adapterraawards.cz/en/databaze/2019/areal-otevrena-zahrada-v-brne"
+}
+Верни только JSON без пояснений.
+        """
+
+        messages = [
+            ChatMessage(role="system", content=system_prompt),
+            ChatMessage(role="user", content=f"Описание кейса: {request.prompt}")
+        ]
+
+        response = Settings.llm.chat(messages)
+        json_str = response.message.content.strip()
+
+        # Очистка от возможных меток кода
+        json_str = json_str.replace('```json', '').replace('```', '').strip()
+
+        # Парсинг JSON
+        data = json.loads(json_str)
+        print(data)
+        return {
+            "success": True,
+            "data": data,
+            "sql": "",
+            "message": "Данные успешно сгенерированы"
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "message": f"Ошибка генерации данных: {str(e)}"
+        }
+
+
+@app.post("/execute-sql")
+async def execute_sql(request: dict):
+    try:
+        sql = request.get("sql", "").strip()
+        if not sql:
+            raise ValueError("SQL запрос не может быть пустым")
+
+        if not sql.lower().startswith("insert into"):
+            raise ValueError("Разрешены только INSERT запросы")
+
+        conn = psycopg2.connect(**PSYCOPG_DB_PARAMS)
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        conn.commit()
+
+        rows_affected = cursor.rowcount
+
+        cursor.close()
+        conn.close()
+
+        return {
+            "success": True,
+            "message": f"Успешно добавлено {rows_affected} записей",
+            "rows_affected": rows_affected
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "message": f"Ошибка выполнения SQL: {str(e)}"
+        }
 
 
 if __name__ == "__main__":

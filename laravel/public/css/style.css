@@ -554,3 +554,34 @@ input[type="button"] {
 .export-buttons .btn:hover {
     animation: none;
 }
+/* Скрытый sidebar */
+/* Полностью скрываем sidebar */
+.sidebar-hidden {
+    width: 60px !important;
+    min-width: 60px !important;
+    max-width: 60px !important;
+    padding-left: 10px !important;
+    padding-right: 10px !important;
+    overflow: hidden;
+}
+
+.sidebar-hidden .scroll_container,
+.sidebar-hidden .search,
+.sidebar-hidden .search_icon,
+.sidebar-hidden .status-indicator,
+.sidebar-hidden .input_button,
+.sidebar-hidden .scroll_header {
+    display: none !important;
+}
+.sidebar-hidden .bin-icon,
+.sidebar-hidden .new-chat-btn {
+    display: none !important;
+}
+#profile-fixed {
+    position: fixed;
+    top: 40px;
+    right: 30px;
+    z-index: 2000;
+}
+
+

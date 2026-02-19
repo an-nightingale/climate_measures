@@ -5,18 +5,39 @@
 @section('content')
     <div class="container-fluid h-100">
         <div class="row h-100">
-            <!-- Боковая панель -->
-            <aside class="sidebar col-md-3 col-lg-2 px-4 py-5">
-                <div class="d-flex flex-column justify-content-between h-100">
-                    <div>
-                        <div class="d-flex flex-row justify-content-between align-items-center mb-4">
-                            <img class="aside_img" src="{{ asset('icons/arrow.png') }}" alt="Скрыть" />
 
+            <aside id="sidebar" class="sidebar col-md-3 col-lg-2 px-4 py-5">
+            <div class="d-flex flex-column justify-content-between h-100">
+                    <div>
+                        <div class="d-flex justify-content-between align-items-center mb-4">
+
+                            <!-- СТРЕЛКА СЛЕВА -->
                             <div>
-                                <img class="aside_img bin-icon" src="{{ asset('icons/bin.png') }}" alt="Корзина" style="cursor: pointer;" title="Режим удаления" />
-                                <img class="aside_img ms-2 new-chat-btn" src="{{ asset('icons/chat.png') }}" alt="Новый чат" style="cursor: pointer;" title="Новый чат" />
+                                <img
+                                    id="sidebarToggle"
+                                    class="aside_img"
+                                    src="{{ asset('icons/arrow.png') }}"
+                                    alt="Свернуть"
+                                    style="cursor:pointer;"
+                                />
                             </div>
+
+                            <!-- ИКОНКИ СПРАВА -->
+                            <div class="d-flex align-items-center gap-3">
+                                <img class="aside_img bin-icon"
+                                     src="{{ asset('icons/bin.png') }}"
+                                     alt="Корзина"
+                                     title="Режим удаления" />
+
+                                <img class="aside_img new-chat-btn"
+                                     src="{{ asset('icons/chat.png') }}"
+                                     alt="Новый чат"
+                                     title="Новый чат" />
+                            </div>
+
                         </div>
+
+
 
                         <div class="position-relative d-flex align-items-center mb-3">
                             <input type="search" class="search w-100 py-0 px-2" placeholder="Поиск в истории..." />
@@ -27,20 +48,7 @@
                         </div>
 
                         <div class="scroll_container">
-                            <h2 class="scroll_header mt-2 mb-0 me-0 ms-0">Сегодня</h2>
-                            <div class="fade_text w-100 position-relative">
-                                <p class="m-0">Меры адаптации к наводнениям</p>
-                            </div>
 
-                            <h2 class="scroll_header mt-3 mb-0 me-0 ms-0">Вчера</h2>
-                            <div class="fade_text w-100 position-relative">
-                                <p class="m-0">Климатические риски для сельского хозяйства</p>
-                            </div>
-
-                            <h2 class="scroll_header mt-3 mb-0 me-0 ms-0">17 сентября</h2>
-                            <div class="fade_text w-100 position-relative">
-                                <p class="m-0">План мероприятий для предотвращения пожаров</p>
-                            </div>
                         </div>
                     </div>
 
@@ -48,30 +56,32 @@
                     <div class="mb-3">
                         <div class="status-indicator text-center p-2 rounded">
                             <small id="statusIndicator" class="text-muted">
-                                <i class="fas fa-circle me-1"></i>Проверка статуса...
+                                <i class="fas fa-circle me-1"></i>Загрузка...
                             </small>
                         </div>
                     </div>
 
                     <div class="input_button px-5 py-2 d-flex justify-content-center align-items-center gap-4">
                         <img class="input_img" src="{{ asset('icons/question.png') }}">
-                        <input class="p-0 m-0" type="button" name="help" value="Помощь" />
+                        <a href="https://clck.ru/3Rti7j" target="_blank"><input class="p-0 m-0" type="button" name="help" value="Помощь" /></a>
                     </div>
                 </div>
             </aside>
 
             <!-- Основной контент -->
-            <main class="main col-md-9 col-lg-10 p-4 position-relative">
-                <header class="d-flex justify-content-between align-items-center mb-4">
+            <main id="mainContent" class="main col-md-9 col-lg-10 p-4 position-relative">
+
+            <header class="d-flex justify-content-between align-items-center mb-4">
                     <a href="#">
                         <img class="logo" src="{{ asset('icons/logo.png') }}" alt="Лого" />
                     </a>
                     <div class="d-flex justify-content-center align-items-center gap-3">
-                        <img class="header_img" src="{{ asset('icons/menu.png') }}" alt="Меню" />
+
 
                         <!-- Выпадающее меню профиля -->
-                        <div class="dropdown">
-                            <a style="color: black;" href="#" class="d-flex align-items-center dropdown-toggle" id="userProfileDropdown" role="button" data-bs-toggle="dropdown" aria-expanded="false">
+                        <div class="dropdown" id="profile-fixed">
+
+                        <a style="color: black;" href="#" class="d-flex align-items-center dropdown-toggle" id="userProfileDropdown" role="button" data-bs-toggle="dropdown" aria-expanded="false">
                                 <img class="header_img" src="{{ asset('icons/account.png') }}" alt="Личный кабинет" />
                             </a>
 
