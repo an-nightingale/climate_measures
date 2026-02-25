@@ -4,8 +4,6 @@ nest-asyncio
 llama-index-embeddings-fastembed 
 fastembed 
 llama-index-vector-stores-faiss
-gradio
-faiss-cpu
 pandas
 llama-index-llms-openrouter
 llama-index-llms-nvidia
@@ -29,3 +27,5 @@ scikit-learn
 numpy
 torch
 transformers
+beautifulsoup4
+lxml
