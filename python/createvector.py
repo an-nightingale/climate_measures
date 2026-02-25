@@ -66,7 +66,7 @@ def process_excel_files(data_path: str):
 
 
 def create_vector_index(data_path: str = "./data"):
-    embed_model = HuggingFaceEmbedding(model_name='intfloat/multilingual-e5-large-instruct')
+    embed_model = HuggingFaceEmbedding(model_name=os.getenv("EMBED_MODEL"))
     Settings.embed_model = embed_model
 
     vector_store = PGVectorStore.from_params(
@@ -75,8 +75,8 @@ def create_vector_index(data_path: str = "./data"):
         password=os.getenv("DB_PASSWORD"),
         port=os.getenv("DB_PORT"),
         user=os.getenv("DB_USERNAME"),
-        table_name="climate_embeddings",
-        embed_dim=1024,
+        table_name=os.getenv("DB_TABLE"),
+        embed_dim=os.getenv("EMBED_DIM"),
         hnsw_kwargs={
             "hnsw_m": 16,
             "hnsw_ef_construction": 64,
@@ -113,11 +113,11 @@ def create_vector_index(data_path: str = "./data"):
 if __name__ == "__main__":
     index = create_vector_index("./data")
 
-    if index:
-        # Тестовый запрос для проверки
-        query_engine = index.as_query_engine()
-        test_response = query_engine.query("Какие мероприятия по адаптации существуют?")
-        print("\nТестовый запрос выполнен успешно!")
-        print(f"Ответ: {test_response}")
-    else:
-        print("Создание индекса завершилось с ошибкой")
+    # if index:
+    #     # Тестовый запрос для проверки
+    #     query_engine = index.as_query_engine()
+    #     test_response = query_engine.query("Какие мероприятия по адаптации существуют?")
+    #     print("\nТестовый запрос выполнен успешно!")
+    #     print(f"Ответ: {test_response}")
+    # else:
+    #     print("Создание индекса завершилось с ошибкой")

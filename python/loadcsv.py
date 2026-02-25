@@ -69,8 +69,8 @@ def load_csv_to_postgres(csv_path: str, table_name: str = "climate_cases"):
 
         # Вставка данных
         insert_query = f"""
-        INSERT INTO {table_name} 
-        (problem, measure_name, mitigation_effect, adaptation_effect, 
+        INSERT INTO {table_name}
+        (problem, measure_name, mitigation_effect, adaptation_effect,
          district_name, climate_conditions, responsible_org, source_url)
         VALUES %s
         ON CONFLICT DO NOTHING;
