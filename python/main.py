@@ -23,6 +23,7 @@ import re
 from bs4 import BeautifulSoup
 import openpyxl.styles
 import json
+from typing import Optional
 
 load_dotenv()
 nest_asyncio.apply()
@@ -90,6 +91,7 @@ RAG_SYSTEM_PROMPT = """
 Приводи те источники, которые используешь для формирования таблицы непосредственно. Источники только из полученного контекста базы знаний, при этом приведи источник соответственно для каждой рекомендуемой тобой меры (сколько строк таблицы, столько и источников). 
 URL в источниках приводи строго такое же, как указано в базе знаний. Наименование мероприятий в источниках бери из базы знаний. В таблице наименования мероприятий формируй без упоминания источников (других кейсов).
 Ответственную организацию в таблице указывай актуальную для региона, который пользователь указал в запросе
+В описаниях мероприятий в таблице не упоминай географические названия (рек, городов и тд) и не упоминай напрямую ничего про кейсы
 """
 
 DIALOG_SYSTEM_PROMPT = """
@@ -127,23 +129,49 @@ CLASSIFIER_SYSTEM_PROMPT = """
 Запрос: "Расскажи про адаптацию в Норвегии"
 Тип: dialog
 
+ВАЖНО: Если во входных данных есть "История диалога", учитывай её. 
+Если пользователь ссылается на предыдущий ответ, который относится к типу rag (например, "добавь ещё меры к таблице выше"), это тип "rag".
+Если пользователь просто благодарит или задает вопрос на новую тему  — "dialog".
 Отвечай ТОЛЬКО одним словом: "rag" или "dialog". Не добавляй никаких пояснений.
 """
 
 
 # === Утилиты для работы с Excel ===
 def read_excel_as_documents(file_path: str):
+    """
+    Создаёт документы для векторного индекса:
+    - Текст для эмбеддинга: только первые 4 столбца
+    - Метаданные: остальные столбцы + служебная информация
+    """
     df = pd.read_excel(file_path)
     docs = []
+
+    # Столбцы для векторизации (по ним будет поиск)
+    embed_columns = ['Проблема', 'Наименование мероприятий', 'Митигационный эффект', 'Адаптационный эффект']
+    # Столбцы для метаданных (добавляются в контекст после поиска)
+    meta_columns = ['Наименование района', 'Агроклиматические условия района', 'Ответственная организация', 'Источник']
+
     for i, row in df.iterrows():
-        text = "\n".join([f"{col}: {row[col]}" for col in df.columns if pd.notna(row[col])])
+        # === Текст для эмбеддинга (только первые 4 колонки) ===
+        embed_text_parts = []
+        for col in embed_columns:
+            if col in df.columns and pd.notna(row[col]):
+                embed_text_parts.append(f"{col}: {row[col]}")
+        embed_text = "\n".join(embed_text_parts)
+
+        # === Метаданные (остальные колонки + служебные) ===
+        metadata = {
+            "source": os.path.basename(file_path),
+            "row_index": i,
+            "file_type": "excel"
+        }
+        for col in meta_columns:
+            if col in df.columns and pd.notna(row[col]):
+                metadata[f"meta_{col}"] = str(row[col])
+
         docs.append(Document(
-            text=text,
-            metadata={
-                "source": os.path.basename(file_path),
-                "row_index": i,
-                "file_type": "excel"
-            }
+            text=embed_text,
+            metadata=metadata
         ))
     return docs
 
@@ -165,23 +193,33 @@ def process_excel_files(data_path: str):
 
 # === Преобразование APPROVED_MEASURES в документы ===
 def get_approved_documents():
+    """
+    Преобразует APPROVED_MEASURES в документы.
+    Для консистентности: первые 4 поля - для поиска, остальные - в метаданные.
+    """
     docs = []
     for i, item in enumerate(APPROVED_MEASURES):
-        text = "\n".join([
+        # Текст для эмбеддинга (первые 4 поля)
+        embed_text = "\n".join([
+            f"Проблема: {item.get('source_question', '')}",
             f"Наименование мероприятий: {item.get('name', '')}",
             f"Митигационный эффект: {item.get('mitigation', '')}",
-            f"Адаптационный эффект: {item.get('adaptation', '')}",
-            f"Актуальность для региона: {item.get('relevance', '')}",
-            f"Ответственная организация: {item.get('responsible', '')}",
-            f"Исходный запрос: {item.get('source_question', '')}"
+            f"Адаптационный эффект: {item.get('adaptation', '')}"
         ])
+
+        # Метаданные (остальные поля)
+        metadata = {
+            "source": "user_approved_in_memory",
+            "row_index": i,
+            "file_type": "user_approved",
+            "meta_Наименование района": item.get('relevance', ''),
+            "meta_Ответственная организация": item.get('responsible', ''),
+            "meta_Источник": ""  # можно добавить поле для URL при одобрении
+        }
+
         docs.append(Document(
-            text=text,
-            metadata={
-                "source": "user_approved_in_memory",
-                "row_index": i,
-                "file_type": "user_approved"
-            }
+            text=embed_text,
+            metadata=metadata
         ))
     return docs
 
@@ -270,11 +308,13 @@ def load_vector_index():
 
 
 # === Модифицированная функция диалогового агента с Яндекс GPT ===
-def generate_dialog_response(user_question: str) -> str:
+def generate_dialog_response(user_question: str, conversation_history: str = None) -> str:
     try:
-        full_prompt = f"""{DIALOG_SYSTEM_PROMPT}
-        Запрос пользователя: {user_question}
-        Пожалуйста, предоставь ответ на основе актуальных данных из интернета."""
+        history_instruction = ""
+        if conversation_history:
+            history_instruction = f"\n\nИстория диалога:\n{conversation_history}\n\nУчитывай предыдущие сообщения."
+
+        full_prompt = f"{DIALOG_SYSTEM_PROMPT}{history_instruction}\nЗапрос пользователя: {user_question}"
         response = yandex_client.responses.create(
             model=f"gpt://{os.getenv('YANDEX_CLOUD_FOLDER')}/{os.getenv('YANDEX_CLOUD_MODEL')}",
             input=full_prompt,
@@ -304,11 +344,17 @@ def generate_dialog_response(user_question: str) -> str:
 
 
 # === Классификатор и RAG функции ===
-def classify_query_tool(user_question: str) -> str:
+def classify_query_tool(user_question: str, conversation_history: str = None) -> str:
     try:
+        # Формируем входные данные для классификатора
+        user_input = user_question
+        if conversation_history:
+            # Добавляем историю, чтобы модель понимала контекст ссылок (например, "эта таблица")
+            user_input = f"История диалога:\n{conversation_history}\n\nТекущий запрос:\n{user_question}"
+
         messages = [
             ChatMessage(role="system", content=CLASSIFIER_SYSTEM_PROMPT),
-            ChatMessage(role="user", content=user_question)
+            ChatMessage(role="user", content=user_input)
         ]
         response = Settings.llm.chat(messages)
         query_type = response.message.content.strip().lower()
@@ -323,18 +369,63 @@ def retrieve_rag_context(user_question: str) -> str:
         index = load_vector_index()
         if index is None:
             return "Ошибка: векторный индекс не загружен"
+
         retriever = index.as_retriever(similarity_top_k=4)
         nodes = retriever.retrieve(user_question)
-        context = "\n\n".join([node.get_content() for node in nodes]) if nodes else "Не найдено релевантных документов."
+
+        # === 🔍 DEBUG: Печать найденных узлов ===
+        print(f"\n🔎 ЗАПРОС: {user_question}")
+        print(f"📊 Найдено узлов: {len(nodes)}")
+        for i, node in enumerate(nodes, 1):
+            print(f"\n--- Узел #{i} (score: {node.score if hasattr(node, 'score') else 'N/A'}) ---")
+            print(f"Текст для поиска: {node.get_content()[:300]}...")  # первые 300 символов
+            print(f"Метаданные: { {k: v for k, v in node.metadata.items() if k.startswith('meta_')} }")
+        print("-" * 80 + "\n")
+        # === /DEBUG ===
+
+        if not nodes:
+            return "Не найдено релевантных документов."
+
+        # Формируем контекст с добавлением метаданных
+        context_parts = []
+        meta_columns_display = {
+            "meta_Наименование района": "Наименование района",
+            "meta_Агроклиматические условия района": "Агроклиматические условия района",
+            "meta_Ответственная организация": "Ответственная организация",
+            "meta_Источник": "Источник"
+        }
+
+        for node in nodes:
+            doc_text = node.get_content()
+            meta_parts = []
+            for meta_key, display_name in meta_columns_display.items():
+                if meta_key in node.metadata and node.metadata[meta_key]:
+                    meta_parts.append(f"{display_name}: {node.metadata[meta_key]}")
+
+            if meta_parts:
+                full_doc = f"{doc_text}\n" + "\n".join(meta_parts)
+            else:
+                full_doc = doc_text
+            context_parts.append(full_doc)
+
+        context = "\n\n---\n\n".join(context_parts)
         return context
+
     except Exception as e:
         return f"Ошибка при извлечении контекста: {str(e)}"
 
 
-def generate_rag_response(user_question: str, context: str) -> str:
+def generate_rag_response(user_question: str, context: str, conversation_history: str = None) -> str:
     try:
-        full_system_prompt = RAG_SYSTEM_PROMPT + f"\n\nКонтекст:\n{context}"
-        print(full_system_prompt)
+        history_instruction = ""
+        if conversation_history:
+            history_instruction = f"\n\nИстория диалога:\n{conversation_history}\n\nУчитывай историю выше при формировании ответа."
+
+        full_system_prompt = RAG_SYSTEM_PROMPT + history_instruction + f"\n\nКонтекст из базы знаний:\n{context}"
+
+        print(f"Контекст: {context}")
+        # === /DEBUG ===
+
         messages = [
             ChatMessage(role="system", content=full_system_prompt),
             ChatMessage(role="user", content="Пользовательский запрос: " + user_question)
@@ -345,17 +436,22 @@ def generate_rag_response(user_question: str, context: str) -> str:
         return f"Ошибка генерации ответа: {str(e)}"
 
 
-def process_query_simple(user_question: str) -> str:
+def process_query_simple(user_question: str, context_history: str = None) -> str:
     if not user_question.strip():
         return "Ошибка: пожалуйста, введите ваш запрос."
-    query_type = classify_query_tool(user_question)
-    print(f"Определен тип запроса: {query_type}")
-    if query_type == "rag":
-        context = retrieve_rag_context(user_question)
-        return generate_rag_response(user_question, context)
-    else:
-        return generate_dialog_response(user_question)
 
+    print(f"\n🔄 Обработка запроса: '{user_question[:100]}{'...' if len(user_question) > 100 else ''}'")
+
+    query_type = classify_query_tool(user_question, conversation_history=context_history)
+    print(f"🏷️ Тип запроса: {query_type}")
+
+    if query_type == "rag":
+        print("🔍 Запуск RAG-поиска...")
+        rag_context = retrieve_rag_context(user_question)  # здесь уже есть debug-печать
+        return generate_rag_response(user_question, rag_context, conversation_history=context_history)
+    else:
+        print("💬 Запуск диалогового режима...")
+        return generate_dialog_response(user_question, conversation_history=context_history)
 
 # === Утилиты для экспорта ===
 def parse_html_table(html: str):
@@ -531,6 +627,8 @@ app.add_middleware(
 
 class QuestionRequest(BaseModel):
     question: str
+    context: Optional[str] = None  # История диалога от PHP
+    conversation_id: Optional[int] = None  # ID диалога (для логики)
 
 
 class QuestionResponse(BaseModel):
@@ -569,7 +667,8 @@ async def root():
 @app.post("/ask", response_model=QuestionResponse)
 async def ask_question_simple(request: QuestionRequest):
     try:
-        answer = process_query_simple(request.question)
+        # Передаем контекст истории в обработку
+        answer = process_query_simple(request.question, context_history=request.context)
         return QuestionResponse(answer=answer, status="success")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
