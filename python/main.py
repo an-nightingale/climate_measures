@@ -31,7 +31,7 @@ nest_asyncio.apply()
 # === Глобальное хранилище одобренных мероприятий (в памяти) ===
 APPROVED_MEASURES = []
 _rebuild_lock = threading.Lock()
-TABLE_NAME = os.getenv("DB_TABLE"),
+TABLE_NAME = os.getenv("DB_TABLE")
 
 yandex_client = openai.OpenAI(
     api_key=os.getenv("YANDEX_CLOUD_API_KEY"),
