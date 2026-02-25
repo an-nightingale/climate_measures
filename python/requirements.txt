@@ -22,3 +22,10 @@ pydantic
 python-multipart
 sqlalchemy
 pgvector
+openai
+requests
+plotly
+scikit-learn
+numpy
+torch
+transformers

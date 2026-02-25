@@ -70,11 +70,11 @@ def create_vector_index(data_path: str = "./data"):
     Settings.embed_model = embed_model
 
     vector_store = PGVectorStore.from_params(
-        database="climate",
-        host="127.0.0.1",
-        password="password",
-        port=5433,
-        user="postgres",
+        database=os.getenv("DB_DATABASE"),
+        host=os.getenv("DB_HOST"),
+        password=os.getenv("DB_PASSWORD"),
+        port=os.getenv("DB_PORT"),
+        user=os.getenv("DB_USERNAME"),
         table_name="climate_embeddings",
         embed_dim=1024,
         hnsw_kwargs={

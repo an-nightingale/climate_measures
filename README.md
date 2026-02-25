@@ -14,6 +14,7 @@ cd python
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
+python loadcsv.py
 python createvector.py
 python main.py
 ```

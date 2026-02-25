@@ -19,11 +19,11 @@ def load_csv_to_postgres(csv_path: str, table_name: str = "climate_cases"):
 
     # Параметры подключения к БД
     DB_CONFIG = {
-        "dbname": os.getenv("DB_DATABASE", "climate"),
-        "user": os.getenv("DB_USERNAME", "postgres"),
-        "password": os.getenv("DB_PASSWORD", "password"),
-        "host": os.getenv("DB_HOST", "127.0.0.1"),
-        "port": os.getenv("DB_PORT", "5433")
+        "dbname": os.getenv("DB_DATABASE"),
+        "user": os.getenv("DB_USERNAME"),
+        "password": os.getenv("DB_PASSWORD"),
+        "host": os.getenv("DB_HOST"),
+        "port": os.getenv("DB_PORT")
     }
 
     try:

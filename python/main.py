@@ -49,19 +49,19 @@ Settings.llm = NVIDIA(
 
 # === Параметры подключения к PostgreSQL ===
 DB_PARAMS = {
-    "database": "climate",
-    "host": "127.0.0.1",
-    "password": "password",
-    "port": 5433,
-    "user": "postgres",
+    "database": os.getenv("DB_DATABASE"),
+    "host": os.getenv("DB_HOST"),
+    "password": os.getenv("DB_PASSWORD"),
+    "port": os.getenv("DB_PORT"),
+    "user": os.getenv("DB_USERNAME"),
     "embed_dim": 1024,
 }
 PSYCOPG_DB_PARAMS = {
-    "database": "climate",
-    "host": "127.0.0.1",
-    "password": "password",
-    "port": 5433,
-    "user": "postgres",
+    "database": os.getenv("DB_DATABASE"),
+    "host": os.getenv("DB_HOST"),
+    "password": os.getenv("DB_PASSWORD"),
+    "port": os.getenv("DB_PORT"),
+    "user": os.getenv("DB_USERNAME"),
 }
 
 # === Промпты ===
@@ -269,7 +269,7 @@ def background_rebuild_index():
             print(f"  → Новая таблица {temp_table} готова")
 
             # 4. АТОМАРНО ПЕРЕКЛЮЧАЕМ ТАБЛИЦЫ
-            conn = psycopg2.connect(dbname="climate", user="postgres", password="password", host="127.0.0.1", port=5433)
+            conn = psycopg2.connect(dbname=os.getenv("DB_DATABASE"), user=os.getenv("DB_USERNAME"), password=os.getenv("DB_PASSWORD"), host=os.getenv("DB_HOST"), port=os.getenv("DB_PORT"))
             cur = conn.cursor()
             cur.execute(f"ALTER TABLE IF EXISTS data_{active_table} RENAME TO {backup_table};")
             cur.execute(f"ALTER TABLE {temp_table} RENAME TO data_{active_table};")
