@@ -24,6 +24,9 @@ from bs4 import BeautifulSoup
 import openpyxl.styles
 import json
 from typing import Optional
+from functools import lru_cache
+import numpy as np
+from rapidfuzz import fuzz
 
 load_dotenv()
 nest_asyncio.apply()
@@ -103,6 +106,7 @@ CLASSIFIER_SYSTEM_PROMPT = """
 Доступные типы:
 - "rag" — запросы, требующие поиска в базе знаний, напрямую связанные с адаптационными мероприятиями для конкретных регионов. Могут быть либо прямыми запросами на составление адаптационных мероприятий, либо описанием существующего климатического риска с просьбой составить адаптационные мероприятия или без просьбы.
 - "dialog" — прочие вопросы, не требующие поиска в базе знаний, в том числе общие вопросы про климатические риски.
+- "statistics" — запросы на получение статистики из базы данных по районам, периодам, показателям и единицам измерения.
 
 Примеры классификации:
 Запрос: "Какие меры по адаптации к засухе для Ялуторовского района?"
@@ -129,10 +133,114 @@ CLASSIFIER_SYSTEM_PROMPT = """
 Запрос: "Расскажи про адаптацию в Норвегии"
 Тип: dialog
 
+Запрос: "Оборот розничной торговли (без субъектов малого предпринимательства) в Абатском районе за 2022 г. в млн. руб."
+Тип: statistics
+
+Запрос: "Вывезено за год твердых коммунальных отходов в Викуловском районе за 2023 г. в тыс. тонн"
+Тип: statistics
+
+Запрос: "Покажи численность населения в Армизонском районе на 1 января 2025 года"
+Тип: statistics
+
 ВАЖНО: Если во входных данных есть "История диалога", учитывай её. 
 Если пользователь ссылается на предыдущий ответ, который относится к типу rag (например, "добавь ещё меры к таблице выше"), это тип "rag".
+Если пользователь ссылается на предыдущий статистический ответ, просит продолжить, уточнить, сравнить или вывести похожий показатель — это тип "statistics".
 Если пользователь просто благодарит или задает вопрос на новую тему  — "dialog".
-Отвечай ТОЛЬКО одним словом: "rag" или "dialog". Не добавляй никаких пояснений.
+Отвечай ТОЛЬКО одним словом: "rag", "dialog" или "statistics". Не добавляй никаких пояснений.
+"""
+STATISTICS_SQL_SYSTEM_PROMPT = """
+Ты — эксперт по PostgreSQL и аналитике статистических данных.
+Сформируй ОДИН безопасный SQL SELECT-запрос к базе статистики.
+
+Правила:
+1. Возвращай только SQL, без пояснений и без Markdown.
+2. Разрешён только SELECT.
+3. Нельзя использовать INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE.
+4. Используй только таблицы и поля из описания схемы.
+5. Используй значения районов, периодов, секций и индикаторов только из переданного контекста.
+6. Район нужно выбирать ВСЕГДА явно через territory.name. Если в запросе пользователя указан район, обязательно добавляй фильтр по territory.name.
+7. Не фильтруй по unit.name, даже если пользователь указал желаемую единицу измерения. Единицы измерения нужно вернуть в результирующих строках, а не использовать как фильтр.
+8. Для периода не ориентируйся на period.name как основной способ фильтрации. Основной способ — period.start_date и period.end_date.
+9. Если пользователь просит значение "за год", считай конечной датой начало следующего года (01.01). Захватывай год полностью, не обрывай раньше времени, если есть показатель за начало последующего года. Отбирай период по диапазону дат:
+   - period.start_date >= DATE '2025-01-01'
+   - period.end_date <= DATE '2026-01-01'
+10. Если пользователь просит "на 1 января 2025 года" или другую дату, то ищи по start_date и end_date этой даты:
+   - period.start_date = DATE '2025-01-01'
+   - period.end_date = DATE '2025-01-01'
+11. Всегда возвращай полную информацию по найденным строкам:
+   - territory.name AS "Территория"
+   - indicator.name AS "Показатель"
+   - section.name AS "Секция"
+   - industry.name AS "Категория"
+   - unit.name AS "Единица измерения"
+   - period_type.name AS "Тип периода"
+   - period.name AS "Период"
+   - period.start_date AS "Дата начала"
+   - period.end_date AS "Дата окончания"
+   - statistic.value AS "Значение"
+12. Обычно нужны JOIN:
+   - statistic -> territory, indicator, period
+   - indicator -> section, unit
+   - section -> industry
+   - period -> period_type
+13. Если пользователь просит одно значение, всё равно возвращай полную строку со всеми полями.
+14. Если пользователь просит несколько районов, сравнение районов, сумму по районам, разницу между районами, сумму за несколько периодов или разницу между периодами — допускаются простые арифметические операции SQL:
+   - SUM(...)
+   - разность двух агрегатов
+   - CASE WHEN
+   - GROUP BY
+   - CTE / WITH
+15. Если пользователь просит разницу между годами, сравни значения за нужные периоды и верни вычисленный результат, но также по возможности приложи исходные строки.
+16. Если пользователь просит сумму показателей двух районов, суммируй statistic.value по нужным районам.
+17. Для поиска показателя ориентируйся прежде всего на indicator.name.
+18. Возвращай понятные русские псевдонимы столбцов.
+19. Если пользователь просит значение "за год", считай конечной датой начало следующего года (01.01). Захватывай год полностью, не обрывай раньше времени, если есть показатель за начало последующего года. Отбирай период по диапазону дат:
+   - period.start_date >= DATE '2025-01-01'
+   - period.end_date <= DATE '2026-01-01'
+Возвращай только SQL.
+"""
+
+STATISTICS_ANSWER_SYSTEM_PROMPT = """
+Ты — ассистент по статистике муниципальных районов.
+Тебе переданы:
+1. Исходный запрос пользователя.
+2. Краткое описание таблиц и полей БД.
+3. Результат SQL-запроса в виде строк "название столбца: значение".
+
+Сформируй краткий ответ на русском языке. Не давай пояснений или таблиц, напиши четкий полный ответ на поставленный вопрос - включи все пункты из самого вопроса и непосредственный ответ. Выделяй важные числа жирным шрифтом, только сами числа.
+
+Правила:
+- Не выдумывай значения, используй только переданные результаты.
+- Если строк несколько, оформи результат списком или Markdown-таблицей.
+- Если результат пустой, честно скажи, что по заданным параметрам данные не найдены, и предложи уточнить показатель, период или район.
+- Не показывай пользователю внутренние технические детали SQL.
+- Если пользователь просил единицу измерения, а в результатах единица другая, выполни перевод единиц в искомые пользователем, если это возможно сделать однозначно.
+- При переводе единиц явно укажи итоговое пересчитанное значение и целевую единицу измерения.
+- Если корректно перевести единицы невозможно или неоднозначно, честно скажи об этом и покажи исходные значения как есть.
+- Если запрос пользователя был на разницу, сумму или другое простое вычисление, объясни результат коротко и понятно.
+"""
+
+STATISTICS_SCHEMA_DESCRIPTION = """
+Таблицы БД статистики:
+- industry(industry_id, name) — отрасль/категория секции.
+- territory_type(territory_type_id, name) — тип территории.
+- unit(unit_id, name) — единица измерения показателя.
+- period_type(period_type_id, name) — тип периода, например "период" или "дата".
+- territory(territory_id, parent_territory_id, territory_type_id, name) — территория, например район.
+- section(section_id, industry_id, name) — раздел статистики.
+- indicator(indicator_id, section_id, unit_id, name) — показатель.
+- period(period_id, period_type_id, name, start_date, end_date) — период или дата.
+- statistic(statistic_id, territory_id, indicator_id, period_id, value) — числовое значение.
+
+Основные связи:
+- statistic.territory_id -> territory.territory_id
+- statistic.indicator_id -> indicator.indicator_id
+- statistic.period_id -> period.period_id
+- indicator.section_id -> section.section_id
+- indicator.unit_id -> unit.unit_id
+- section.industry_id -> industry.industry_id
+- period.period_type_id -> period_type.period_type_id
+- territory.territory_type_id -> territory_type.territory_type_id
 """
 
 
@@ -269,7 +377,9 @@ def background_rebuild_index():
             print(f"  → Новая таблица {temp_table} готова")
 
             # 4. АТОМАРНО ПЕРЕКЛЮЧАЕМ ТАБЛИЦЫ
-            conn = psycopg2.connect(dbname=os.getenv("DB_DATABASE"), user=os.getenv("DB_USERNAME"), password=os.getenv("DB_PASSWORD"), host=os.getenv("DB_HOST"), port=os.getenv("DB_PORT"))
+            conn = psycopg2.connect(dbname=os.getenv("DB_DATABASE"), user=os.getenv("DB_USERNAME"),
+                                    password=os.getenv("DB_PASSWORD"), host=os.getenv("DB_HOST"),
+                                    port=os.getenv("DB_PORT"))
             cur = conn.cursor()
             cur.execute(f"ALTER TABLE IF EXISTS data_{active_table} RENAME TO {backup_table};")
             cur.execute(f"ALTER TABLE {temp_table} RENAME TO data_{active_table};")
@@ -343,13 +453,350 @@ def generate_dialog_response(user_question: str, conversation_history: str = Non
         return f"Ошибка при обработке запроса: {str(e)}"
 
 
+# === Статистический агент ===
+def get_db_connection():
+    return psycopg2.connect(**PSYCOPG_DB_PARAMS)
+
+
+@lru_cache(maxsize=1)
+def get_statistics_metadata(_cache_key: int):
+    conn = get_db_connection()
+    try:
+        indicators_df = pd.read_sql_query(
+            """
+            SELECT i.name AS indicator_name,
+                   s.name AS section_name,
+                   u.name AS unit_name,
+                   COALESCE(ind.name, '') AS industry_name
+            FROM indicator i
+            JOIN section s ON s.section_id = i.section_id
+            JOIN unit u ON u.unit_id = i.unit_id
+            LEFT JOIN industry ind ON ind.industry_id = s.industry_id
+            ORDER BY s.name, i.name
+            """,
+            conn,
+        )
+        territories_df = pd.read_sql_query(
+            """
+            SELECT t.name AS territory_name,
+                   COALESCE(tt.name, '') AS territory_type
+            FROM territory t
+            LEFT JOIN territory_type tt ON tt.territory_type_id = t.territory_type_id
+            ORDER BY t.name
+            """,
+            conn,
+        )
+        periods_df = pd.read_sql_query(
+            """
+            SELECT p.name AS period_name,
+                   COALESCE(pt.name, '') AS period_type,
+                   p.start_date,
+                   p.end_date
+            FROM period p
+            LEFT JOIN period_type pt ON pt.period_type_id = p.period_type_id
+            ORDER BY p.name
+            """,
+            conn,
+        )
+        units_df = pd.read_sql_query("SELECT name AS unit_name FROM unit ORDER BY name", conn)
+        sections_df = pd.read_sql_query(
+            """
+            SELECT s.name AS section_name,
+                   COALESCE(ind.name, '') AS industry_name
+            FROM section s
+            LEFT JOIN industry ind ON ind.industry_id = s.industry_id
+            ORDER BY s.name
+            """,
+            conn,
+        )
+        return {
+            "indicators": indicators_df,
+            "territories": territories_df,
+            "periods": periods_df,
+            "units": units_df,
+            "sections": sections_df,
+        }
+    finally:
+        conn.close()
+
+
+def invalidate_statistics_metadata_cache():
+    get_statistics_metadata.cache_clear()
+
+
+def statistics_cache_key() -> int:
+    return int(time.time() // 300)
+
+
+def get_top_similar_territories(user_question: str, top_k: int = 2, min_score: float = 70.0) -> pd.DataFrame:
+    metadata = get_statistics_metadata(statistics_cache_key())
+    territories_df = metadata["territories"].copy()
+
+    def score_row(row) -> float:
+        return float(fuzz.partial_ratio(user_question.lower(), str(row["territory_name"]).lower()))
+
+    territories_df["similarity"] = territories_df.apply(score_row, axis=1)
+
+    top_df = (
+        territories_df
+        .sort_values("similarity", ascending=False)
+        .head(top_k)
+        .reset_index(drop=True)
+    )
+
+    top_df = top_df[top_df["similarity"] >= min_score].reset_index(drop=True)
+    return top_df
+
+
+def get_indicators_for_territories(territory_names: list[str]) -> pd.DataFrame:
+    if not territory_names:
+        metadata = get_statistics_metadata(statistics_cache_key())
+        return metadata["indicators"].copy()
+
+    conn = get_db_connection()
+    try:
+        sql = """
+        SELECT DISTINCT
+               i.name AS indicator_name,
+               s.name AS section_name,
+               u.name AS unit_name,
+               COALESCE(ind.name, '') AS industry_name,
+               t.name AS territory_name
+        FROM statistic st
+        JOIN territory t ON t.territory_id = st.territory_id
+        JOIN indicator i ON i.indicator_id = st.indicator_id
+        JOIN section s ON s.section_id = i.section_id
+        JOIN unit u ON u.unit_id = i.unit_id
+        LEFT JOIN industry ind ON ind.industry_id = s.industry_id
+        WHERE t.name = ANY(%s)
+        ORDER BY i.name
+        """
+        return pd.read_sql_query(sql, conn, params=(territory_names,))
+    finally:
+        conn.close()
+
+
+def cosine_similarity_matrix(query_vec: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    query_norm = np.linalg.norm(query_vec)
+    matrix_norms = np.linalg.norm(matrix, axis=1)
+
+    if query_norm == 0:
+        return np.zeros(len(matrix), dtype=float)
+
+    safe_denominator = np.where(matrix_norms == 0, 1e-12, matrix_norms)
+    sims = matrix @ query_vec / (safe_denominator * query_norm)
+    return sims
+
+
+@lru_cache(maxsize=1)
+def get_indicator_embeddings(_cache_key: int):
+    metadata = get_statistics_metadata(_cache_key)
+    indicators_df = metadata["indicators"].copy()
+
+    indicator_texts = []
+    for _, row in indicators_df.iterrows():
+        indicator_texts.append(
+            f"Показатель: {row['indicator_name']}. "
+            f"Секция: {row['section_name']}. "
+            f"Единица: {row['unit_name']}. "
+            f"Категория: {row['industry_name']}."
+        )
+
+    embeddings = Settings.embed_model.get_text_embedding_batch(indicator_texts)
+    embeddings_matrix = np.array(embeddings, dtype=np.float32)
+
+    return indicators_df, embeddings_matrix
+
+
+def get_top_similar_indicators(user_question: str, top_k: int = 30) -> tuple[pd.DataFrame, pd.DataFrame]:
+    matched_territories_df = get_top_similar_territories(user_question)
+    matched_territory_names = matched_territories_df["territory_name"].dropna().astype(str).tolist()
+
+    indicators_df = get_indicators_for_territories(matched_territory_names).copy()
+
+    if indicators_df.empty:
+        metadata = get_statistics_metadata(statistics_cache_key())
+        indicators_df = metadata["indicators"].copy()
+
+    def score_row(row) -> float:
+        candidate = " | ".join([
+            str(row["indicator_name"]),
+            str(row["section_name"]),
+            str(row["unit_name"]),
+            str(row["industry_name"]),
+        ])
+        return float(fuzz.token_sort_ratio(user_question.lower(), candidate.lower()))
+
+    indicators_df["similarity"] = indicators_df.apply(score_row, axis=1)
+
+    top_df = (
+        indicators_df
+        .sort_values("similarity", ascending=False)
+        .head(top_k)
+        .reset_index(drop=True)
+    )
+
+    return matched_territories_df, top_df
+
+
+def format_statistics_context(user_question: str) -> str:
+    metadata = get_statistics_metadata(statistics_cache_key())
+
+    matched_territories_df, top_indicators_df = get_top_similar_indicators(user_question, top_k=30)
+    print("\n--- TOP SIMILAR TERRITORIES ---")
+    for _, row in matched_territories_df.iterrows():
+        print(f"{row['similarity']:.2f} | {row['territory_name']}")
+
+    print("\n--- TOP SIMILAR INDICATORS ---")
+    for _, row in top_indicators_df.iterrows():
+        print(f"{row['similarity']:.4f} | {row['indicator_name']} | {row['section_name']} | {row['unit_name']}")
+    print("--- END TOP SIMILAR INDICATORS ---\n")
+
+    indicators_lines = []
+    for _, row in top_indicators_df.iterrows():
+        indicators_lines.append(
+            f"- {row['indicator_name']} | секция: {row['section_name']} | единица: {row['unit_name']} | категория: {row['industry_name']} | similarity: {row['similarity']:.4f}"
+        )
+
+    territories_lines = []
+    for _, row in metadata["territories"].head(500).iterrows():
+        territories_lines.append(f"- {row['territory_name']} | тип: {row['territory_type']}")
+
+    periods_lines = []
+    for _, row in metadata["periods"].head(500).iterrows():
+        periods_lines.append(
+            f"- {row['period_name']} | тип: {row['period_type']} | start_date: {row['start_date']} | end_date: {row['end_date']}"
+        )
+
+    units_lines = [f"- {u}" for u in metadata["units"]["unit_name"].dropna().astype(str).tolist()]
+    sections_lines = [
+        f"- {row['section_name']} | категория: {row['industry_name']}"
+        for _, row in metadata["sections"].head(500).iterrows()
+    ]
+
+    return (
+            f"{STATISTICS_SCHEMA_DESCRIPTION}\n\n"
+            f"Доступные территории:\n" + "\n".join(territories_lines) + "\n\n"
+                                                                        f"Доступные периоды:\n" + "\n".join(
+        periods_lines) + "\n\n"
+                         f"Доступные единицы измерения:\n" + "\n".join(units_lines) + "\n\n"
+                                                                                      f"Доступные секции:\n" + "\n".join(
+        sections_lines) + "\n\n"
+                          f"Доступные индикаторы:\n" + "\n".join(indicators_lines)
+    )
+
+
+def extract_sql_from_llm_response(text: str) -> str:
+    return text.strip().replace("```sql", "").replace("```", "").strip()
+
+
+def validate_statistics_sql(sql: str) -> str:
+    sql_clean = sql.strip().rstrip(";")
+    sql_lower = sql_clean.lower()
+
+    if not (sql_lower.startswith("select") or sql_lower.startswith("with")):
+        raise ValueError("Статистический агент может выполнять только SELECT-запросы")
+
+    padded = f" {sql_lower} "
+    for token in [" insert ", " update ", " delete ", " drop ", " alter ", " truncate ", " create ", " grant ",
+                  " revoke "]:
+        if token in padded:
+            raise ValueError("Обнаружен запрещённый SQL-оператор")
+
+    if ";" in sql_clean:
+        raise ValueError("Разрешён только один SQL-запрос")
+
+    return sql_clean
+
+
+def generate_statistics_sql(user_question: str, conversation_history: str = None) -> str:
+    context = format_statistics_context(user_question)
+    history_block = f"\n\nИстория диалога:\n{conversation_history}" if conversation_history else ""
+    messages = [
+        ChatMessage(role="system", content=STATISTICS_SQL_SYSTEM_PROMPT),
+        ChatMessage(
+            role="user",
+            content=(
+                f"{context}{history_block}\n\n"
+                f"Запрос пользователя:\n{user_question}\n\n"
+                f"Сформируй SQL SELECT-запрос."
+            ),
+        ),
+    ]
+    print("\n" + "=" * 80)
+    print("🧠 PROMPT ДЛЯ SQL-МОДЕЛИ")
+    print("=" * 80)
+    print("SYSTEM PROMPT:")
+    print(STATISTICS_SQL_SYSTEM_PROMPT)
+    print("-" * 80)
+    print("USER MESSAGE:")
+    print(
+        f"{context}{history_block}\n\n"
+        f"Запрос пользователя:\n{user_question}\n\n"
+        f"Сформируй SQL SELECT-запрос."
+    )
+    print("=" * 80 + "\n")
+    response = Settings.llm.chat(messages)
+    return validate_statistics_sql(extract_sql_from_llm_response(response.message.content))
+
+
+def execute_statistics_sql(sql: str) -> pd.DataFrame:
+    conn = get_db_connection()
+    try:
+        return pd.read_sql_query(sql, conn)
+    finally:
+        conn.close()
+
+
+def dataframe_to_llm_rows(df: pd.DataFrame, max_rows: int = 50) -> str:
+    if df.empty:
+        return "Результат пуст."
+
+    lines = []
+    for i, (_, row) in enumerate(df.head(max_rows).iterrows(), start=1):
+        parts = []
+        for col in df.columns:
+            parts.append(f"{col}: {row[col]}")
+        lines.append(f"Строка {i}: " + "; ".join(parts))
+
+    return "\n".join(lines)
+
+
+def generate_statistics_answer(user_question: str, sql: str, df: pd.DataFrame) -> str:
+    rows_text = dataframe_to_llm_rows(df)
+    messages = [
+        ChatMessage(role="system", content=STATISTICS_ANSWER_SYSTEM_PROMPT),
+        ChatMessage(
+            role="user",
+            content=(
+                f"Описание структуры БД:\n{STATISTICS_SCHEMA_DESCRIPTION}\n\n"
+                f"Запрос пользователя:\n{user_question}\n\n"
+                f"SQL-запрос:\n{sql}\n\n"
+                f"Результаты:\n{rows_text}"
+            ),
+        ),
+    ]
+    response = Settings.llm.chat(messages)
+    return response.message.content
+
+
+def generate_statistics_response(user_question: str, conversation_history: str = None) -> str:
+    try:
+        sql = generate_statistics_sql(user_question, conversation_history=conversation_history)
+        print(f"📈 SQL statistics agent: {sql}")
+        df = execute_statistics_sql(sql)
+        print(f"📊 Statistics rows returned: {len(df)}")
+        return generate_statistics_answer(user_question, sql, df)
+    except Exception as e:
+        print(f"Ошибка статистического агента: {e}")
+        return f"Ошибка при обработке статистического запроса: {str(e)}"
+
+
 # === Классификатор и RAG функции ===
 def classify_query_tool(user_question: str, conversation_history: str = None) -> str:
     try:
-        # Формируем входные данные для классификатора
         user_input = user_question
         if conversation_history:
-            # Добавляем историю, чтобы модель понимала контекст ссылок (например, "эта таблица")
             user_input = f"История диалога:\n{conversation_history}\n\nТекущий запрос:\n{user_question}"
 
         messages = [
@@ -358,7 +805,7 @@ def classify_query_tool(user_question: str, conversation_history: str = None) ->
         ]
         response = Settings.llm.chat(messages)
         query_type = response.message.content.strip().lower()
-        return query_type if query_type in ["rag", "dialog"] else "dialog"
+        return query_type if query_type in ["rag", "dialog", "statistics"] else "dialog"
     except Exception as e:
         print(f"Ошибка классификации: {e}")
         return "dialog"
@@ -440,18 +887,22 @@ def process_query_simple(user_question: str, context_history: str = None) -> str
     if not user_question.strip():
         return "Ошибка: пожалуйста, введите ваш запрос."
 
-    print(f"\n🔄 Обработка запроса: '{user_question[:100]}{'...' if len(user_question) > 100 else ''}'")
+    print(f"\nОбработка запроса: '{user_question[:100]}{'...' if len(user_question) > 100 else ''}'")
 
     query_type = classify_query_tool(user_question, conversation_history=context_history)
-    print(f"🏷️ Тип запроса: {query_type}")
+    print(f"Тип запроса: {query_type}")
 
     if query_type == "rag":
-        print("🔍 Запуск RAG-поиска...")
-        rag_context = retrieve_rag_context(user_question)  # здесь уже есть debug-печать
+        print("Запуск RAG-поиска...")
+        rag_context = retrieve_rag_context(user_question)
         return generate_rag_response(user_question, rag_context, conversation_history=context_history)
-    else:
-        print("💬 Запуск диалогового режима...")
-        return generate_dialog_response(user_question, conversation_history=context_history)
+    if query_type == "statistics":
+        print("Запуск статистического агента...")
+        return generate_statistics_response(user_question, conversation_history=context_history)
+
+    print("Запуск диалогового режима...")
+    return generate_dialog_response(user_question, conversation_history=context_history)
+
 
 # === Утилиты для экспорта ===
 def parse_html_table(html: str):

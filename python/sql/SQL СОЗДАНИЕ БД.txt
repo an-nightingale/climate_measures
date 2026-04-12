@@ -1,0 +1,176 @@
+-- =========================================
+-- 1. DROP TABLES IF EXISTS
+-- =========================================
+
+DROP TABLE IF EXISTS statistic CASCADE;
+DROP TABLE IF EXISTS indicator CASCADE;
+DROP TABLE IF EXISTS period CASCADE;
+DROP TABLE IF EXISTS period_type CASCADE;
+DROP TABLE IF EXISTS section CASCADE;
+DROP TABLE IF EXISTS unit CASCADE;
+DROP TABLE IF EXISTS territory CASCADE;
+DROP TABLE IF EXISTS territory_type CASCADE;
+DROP TABLE IF EXISTS industry CASCADE;
+
+-- =========================================
+-- 2. REFERENCE TABLES
+-- =========================================
+
+CREATE TABLE industry (
+    industry_id      SERIAL PRIMARY KEY,
+    name             VARCHAR(200) NOT NULL UNIQUE
+);
+
+CREATE TABLE territory_type (
+    territory_type_id SERIAL PRIMARY KEY,
+    name              VARCHAR(200) NOT NULL UNIQUE
+);
+
+CREATE TABLE unit (
+    unit_id           SERIAL PRIMARY KEY,
+    name              VARCHAR(200) NOT NULL UNIQUE
+);
+
+CREATE TABLE period_type (
+    period_type_id    SERIAL PRIMARY KEY,
+    name              VARCHAR(200) NOT NULL UNIQUE
+);
+
+-- =========================================
+-- 3. MAIN DICTIONARIES
+-- =========================================
+
+CREATE TABLE territory (
+    territory_id         SERIAL PRIMARY KEY,
+    parent_territory_id  INT NULL,
+    territory_type_id    INT NOT NULL,
+    name                 VARCHAR(255) NOT NULL,
+
+    CONSTRAINT fk_territory_parent
+        FOREIGN KEY (parent_territory_id)
+        REFERENCES territory (territory_id)
+        ON DELETE SET NULL,
+
+    CONSTRAINT fk_territory_type
+        FOREIGN KEY (territory_type_id)
+        REFERENCES territory_type (territory_type_id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT uq_territory_name_type_parent
+        UNIQUE (name, territory_type_id, parent_territory_id),
+
+    CONSTRAINT chk_territory_not_self_parent
+        CHECK (parent_territory_id IS NULL OR parent_territory_id <> territory_id)
+);
+
+CREATE TABLE section (
+    section_id        SERIAL PRIMARY KEY,
+    industry_id       INT NOT NULL,
+    name              VARCHAR(255) NOT NULL,
+
+    CONSTRAINT fk_section_industry
+        FOREIGN KEY (industry_id)
+        REFERENCES industry (industry_id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT uq_section_name
+        UNIQUE (name)
+);
+
+CREATE TABLE indicator (
+    indicator_id      SERIAL PRIMARY KEY,
+    section_id        INT NOT NULL,
+    unit_id           INT NOT NULL,
+    name              TEXT NOT NULL,
+
+    CONSTRAINT fk_indicator_section
+        FOREIGN KEY (section_id)
+        REFERENCES section (section_id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_indicator_unit
+        FOREIGN KEY (unit_id)
+        REFERENCES unit (unit_id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT uq_indicator_section_name
+        UNIQUE (section_id, name)
+);
+
+CREATE TABLE period (
+    period_id         SERIAL PRIMARY KEY,
+    period_type_id    INT NOT NULL,
+    name              VARCHAR(255) NOT NULL,
+    start_date        DATE NULL,
+    end_date          DATE NULL,
+
+    CONSTRAINT fk_period_period_type
+        FOREIGN KEY (period_type_id)
+        REFERENCES period_type (period_type_id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT uq_period_name_type
+        UNIQUE (period_type_id, name),
+
+    CONSTRAINT chk_period_dates
+        CHECK (
+            start_date IS NULL
+            OR end_date IS NULL
+            OR start_date <= end_date
+        )
+);
+
+-- =========================================
+-- 4. FACT TABLE
+-- =========================================
+
+CREATE TABLE statistic (
+    statistic_id      SERIAL PRIMARY KEY,
+    territory_id      INT NOT NULL,
+    indicator_id      INT NOT NULL,
+    period_id         INT NOT NULL,
+    value             NUMERIC(20,4) NOT NULL,
+
+    CONSTRAINT fk_statistic_territory
+        FOREIGN KEY (territory_id)
+        REFERENCES territory (territory_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_statistic_indicator
+        FOREIGN KEY (indicator_id)
+        REFERENCES indicator (indicator_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_statistic_period
+        FOREIGN KEY (period_id)
+        REFERENCES period (period_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT uq_statistic_territory_indicator_period
+        UNIQUE (territory_id, indicator_id, period_id)
+);
+
+-- =========================================
+-- 5. INDEXES
+-- =========================================
+
+CREATE INDEX idx_section_industry
+    ON section (industry_id);
+
+CREATE INDEX idx_indicator_section
+    ON indicator (section_id);
+
+CREATE INDEX idx_indicator_unit
+    ON indicator (unit_id);
+
+CREATE INDEX idx_period_period_type
+    ON period (period_type_id);
+
+CREATE INDEX idx_statistic_territory
+    ON statistic (territory_id);
+
+CREATE INDEX idx_statistic_indicator
+    ON statistic (indicator_id);
+
+CREATE INDEX idx_statistic_period
+    ON statistic (period_id);
