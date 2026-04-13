@@ -35,6 +35,8 @@ nest_asyncio.apply()
 APPROVED_MEASURES = []
 _rebuild_lock = threading.Lock()
 TABLE_NAME = "climate_embeddings"
+NPA_XLSX_PATH = "./data/нпа.xlsx"
+METHOD_XLSX_PATH = "./data/методрекомендации.xlsx"
 
 yandex_client = openai.OpenAI(
     api_key=os.getenv("YANDEX_CLOUD_API_KEY"),
@@ -101,12 +103,41 @@ DIALOG_SYSTEM_PROMPT = """
 Ты — экспертный ассистент по вопросам климатических рисков для Тюменской области. Отвечай на вопросы пользователя максимально точно и полезно. Ищи актуальную информацию. После поиска дай пользователю краткий, структурированный ответ, выдели ключевые факты. Если использовал внешние источники - в конце напиши ссылки на страницы, с которых взята информация.
 """
 
+NPA_SYSTEM_PROMPT = """
+Ты — экспертный ассистент по нормативным правовым актам (НПА), ГОСТам, СП, приказам, постановлениям и методическим рекомендациям в сфере адаптации к изменениям климата, предупреждения и ликвидации последствий опасных природных явлений, в том числе паводков, подтоплений, наводнений, жары, засухи, природных пожаров и других климатических рисков.
+
+Тебе передаются:
+1. Вопрос пользователя
+2. Контекст из локальных таблиц Excel со списком НПА и методических рекомендаций
+3. Дополнительная информация из web search
+
+Правила ответа:
+- Сначала опирайся на локальные таблицы Excel.
+- Если web search дал полезные дополнения, используй их как дополнительные источники.
+- Не выдумывай документы.
+- Не говори, из локальных таблиц или web-search берешь документы. Просто отвечай на вопрос.
+- Если документ есть в локальном контексте, считай его приоритетным.
+- Для каждого документа по возможности указывай:
+  - вид документа
+  - орган / источник
+  - название
+  - номер
+  - дату
+  - ссылку на документ
+- Отвечай на русском языке.
+- Структурируй ответ с помощью списков, но без таблиц.
+- Пиши структурированно и по существу.
+- Предоставляй только те виды документов, которые запросил пользователь.
+- Пиши полный ответ, но не слишком много. Выбирай самое важное.
+"""
+
 CLASSIFIER_SYSTEM_PROMPT = """
 Ты — классификатор запросов. Твоя задача — определить тип запроса пользователя.
 Доступные типы:
 - "rag" — запросы, требующие поиска в базе знаний, напрямую связанные с адаптационными мероприятиями для конкретных регионов. Могут быть либо прямыми запросами на составление адаптационных мероприятий, либо описанием существующего климатического риска с просьбой составить адаптационные мероприятия или без просьбы.
 - "dialog" — прочие вопросы, не требующие поиска в базе знаний, в том числе общие вопросы про климатические риски.
 - "statistics" — запросы на получение статистики из базы данных по районам, периодам, показателям и единицам измерения.
+- "npa" — запросы про нормативные документы, ГОСТы, СП, приказы, постановления, распоряжения, методические рекомендации, регламенты, инструкции, правила и порядок действий.
 
 Примеры классификации:
 Запрос: "Какие меры по адаптации к засухе для Ялуторовского района?"
@@ -142,11 +173,17 @@ CLASSIFIER_SYSTEM_PROMPT = """
 Запрос: "Покажи численность населения в Армизонском районе на 1 января 2025 года"
 Тип: statistics
 
+Запрос: "Какие ГОСТы и СП применяются при защите территорий от подтопления?"
+Тип: npa
+
+Запрос: "Есть ли методические рекомендации по адаптации к климатическим рискам?"
+Тип: npa
+
 ВАЖНО: Если во входных данных есть "История диалога", учитывай её. 
 Если пользователь ссылается на предыдущий ответ, который относится к типу rag (например, "добавь ещё меры к таблице выше"), это тип "rag".
 Если пользователь ссылается на предыдущий статистический ответ, просит продолжить, уточнить, сравнить или вывести похожий показатель — это тип "statistics".
 Если пользователь просто благодарит или задает вопрос на новую тему  — "dialog".
-Отвечай ТОЛЬКО одним словом: "rag", "dialog" или "statistics". Не добавляй никаких пояснений.
+Отвечай ТОЛЬКО одним словом: "rag", "dialog", "statistics" или "npa". Не добавляй никаких пояснений.
 """
 STATISTICS_SQL_SYSTEM_PROMPT = """
 Ты — эксперт по PostgreSQL и аналитике статистических данных.
@@ -157,13 +194,14 @@ STATISTICS_SQL_SYSTEM_PROMPT = """
 2. Разрешён только SELECT.
 3. Нельзя использовать INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE.
 4. Используй только таблицы и поля из описания схемы.
-5. Используй значения районов, периодов, секций и индикаторов только из переданного контекста.
+5. Используй значения районов, периодов, секций и индикаторов только из переданного контекста. Бери полные названия в точности как в контексте.
 6. Район нужно выбирать ВСЕГДА явно через territory.name. Если в запросе пользователя указан район, обязательно добавляй фильтр по territory.name.
 7. Не фильтруй по unit.name, даже если пользователь указал желаемую единицу измерения. Единицы измерения нужно вернуть в результирующих строках, а не использовать как фильтр.
 8. Для периода не ориентируйся на period.name как основной способ фильтрации. Основной способ — period.start_date и period.end_date.
 9. Если пользователь просит значение "за год", считай конечной датой начало следующего года (01.01). Захватывай год полностью, не обрывай раньше времени, если есть показатель за начало последующего года. Отбирай период по диапазону дат:
    - period.start_date >= DATE '2025-01-01'
    - period.end_date <= DATE '2026-01-01'
+   Аналогично если просит на конец года
 10. Если пользователь просит "на 1 января 2025 года" или другую дату, то ищи по start_date и end_date этой даты:
    - period.start_date = DATE '2025-01-01'
    - period.end_date = DATE '2025-01-01'
@@ -197,6 +235,14 @@ STATISTICS_SQL_SYSTEM_PROMPT = """
 19. Если пользователь просит значение "за год", считай конечной датой начало следующего года (01.01). Захватывай год полностью, не обрывай раньше времени, если есть показатель за начало последующего года. Отбирай период по диапазону дат:
    - period.start_date >= DATE '2025-01-01'
    - period.end_date <= DATE '2026-01-01'
+20. Для литералов дат используй строго формат PostgreSQL:
+   DATE '2025-01-01'
+   Используй только одинарные кавычки один раз. Никогда не пиши DATE ''2025-01-01''.
+21. Не используй временные периоды по примеру:
+    ((p.start_date = DATE '2024-01-01' AND p.end_date = DATE '2024-12-31')
+       OR (p.start_date = DATE '2025-01-01' AND p.end_date = DATE '2025-12-31'))
+    А бери целиком временной период от начала до конца, более обширный.
+22. Проверяй, что SQL должен быть синтаксически правильным.
 Возвращай только SQL.
 """
 
@@ -218,6 +264,7 @@ STATISTICS_ANSWER_SYSTEM_PROMPT = """
 - При переводе единиц явно укажи итоговое пересчитанное значение и целевую единицу измерения.
 - Если корректно перевести единицы невозможно или неоднозначно, честно скажи об этом и покажи исходные значения как есть.
 - Если запрос пользователя был на разницу, сумму или другое простое вычисление, объясни результат коротко и понятно.
+- Если пользователь просит значение "за год", обязательно бери конечной датой начало следующего года (01.01) или конец искомого (31.12), в зависимости от того. какая есть последняя дата. Более ранние даты (октябрь, ноябрь и т.д.) за конечные не бери!! Например если просит за 2025, то считай началом 01.01.2025, а концом 01.01.2026 или 31.12.2025, в завимимости от того, что есть.
 """
 
 STATISTICS_SCHEMA_DESCRIPTION = """
@@ -453,6 +500,145 @@ def generate_dialog_response(user_question: str, conversation_history: str = Non
         return f"Ошибка при обработке запроса: {str(e)}"
 
 
+# нормативный агент
+@lru_cache(maxsize=1)
+def load_npa_context() -> str:
+    parts = []
+
+    # ===== НПА =====
+    if os.path.exists(NPA_XLSX_PATH):
+        try:
+            df_npa = pd.read_excel(NPA_XLSX_PATH).fillna("")
+            npa_lines = []
+            for _, row in df_npa.iterrows():
+                row_dict = {str(k).strip(): str(v).strip() for k, v in row.to_dict().items() if str(v).strip()}
+                line = " | ".join([f"{k}: {v}" for k, v in row_dict.items()])
+                if line:
+                    npa_lines.append(line)
+
+            if npa_lines:
+                parts.append("Нормативные документы из локального файла:\n" + "\n".join(f"- {x}" for x in npa_lines))
+        except Exception as e:
+            parts.append(f"Ошибка чтения файла НПА: {e}")
+
+    # ===== Методические рекомендации =====
+    if os.path.exists(METHOD_XLSX_PATH):
+        try:
+            df_method = pd.read_excel(METHOD_XLSX_PATH).fillna("")
+            method_lines = []
+            for _, row in df_method.iterrows():
+                row_dict = {str(k).strip(): str(v).strip() for k, v in row.to_dict().items() if str(v).strip()}
+                line = " | ".join([f"{k}: {v}" for k, v in row_dict.items()])
+                if line:
+                    method_lines.append(line)
+
+            if method_lines:
+                parts.append(
+                    "Методические рекомендации из локального файла:\n" + "\n".join(f"- {x}" for x in method_lines))
+        except Exception as e:
+            parts.append(f"Ошибка чтения файла методических рекомендаций: {e}")
+
+    return "\n\n".join(parts) if parts else "Локальные файлы с НПА и методическими рекомендациями не найдены."
+
+
+def generate_npa_response(user_question: str, conversation_history: str = None) -> str:
+    try:
+        local_context = load_npa_context()
+
+        history_instruction = ""
+        if conversation_history:
+            history_instruction = f"\n\nИстория диалога:\n{conversation_history}"
+
+        # 1. Сначала отдельный запрос в Яндекс-модель ТОЛЬКО для web search
+        web_search_prompt = f"""
+Ты — ассистент по поиску нормативных документов и методических рекомендаций.
+
+Твоя задача:
+- обязательно использовать web search;
+- найти релевантные нормативные документы, ГОСТы, СП, приказы, постановления, методические рекомендации;
+- вернуть краткую структурированную выжимку результатов поиска.
+
+Правила:
+- обязательно выполни web search;
+- не отвечай общими рассуждениями без найденных документов;
+- для каждого найденного документа по возможности укажи:
+  - вид документа
+  - название
+  - орган
+  - номер
+  - дату
+  - ссылку
+  - почему документ релевантен вопросу
+
+Вопрос пользователя:
+{user_question}
+""".strip()
+
+        web_response = yandex_client.responses.create(
+            model=f"gpt://{os.getenv('YANDEX_CLOUD_FOLDER')}/{os.getenv('YANDEX_CLOUD_MODEL')}",
+            input=web_search_prompt,
+            tools=[
+                {
+                    "type": "web_search",
+                    "filters": {
+                        "allowed_domains": [],
+                        "user_location": {
+                            "region": "225",
+                        }
+                    },
+                    "search_context_size": "medium",
+                }
+            ],
+            temperature=0.1,
+            max_output_tokens=2000
+        )
+
+        web_search_result = ""
+        if hasattr(web_response, "output_text") and web_response.output_text:
+            web_search_result = web_response.output_text.strip()
+        else:
+            web_search_result = "Web search не вернул содержательного результата."
+
+        print("\n" + "=" * 80)
+        print("🌐 WEB SEARCH RESULT")
+        print("=" * 80)
+        print(web_search_result[:4000])
+        print("=" * 80 + "\n")
+
+        # 2. Потом передаем локальный контекст + результат web search в основную модель
+        final_system_prompt = f"""
+{NPA_SYSTEM_PROMPT}
+
+Ниже дан дополнительный результат web search из внешней модели.
+Используй его как дополнительный источник, но локальный Excel-контекст считай приоритетным, если в нем уже есть релевантные документы.
+Не выдумывай документы и не дублируй одинаковые позиции.
+""".strip()
+
+        final_user_prompt = f"""
+{history_instruction}
+
+Локальный контекст из Excel:
+{local_context}
+
+Результат web search:
+{web_search_result}
+
+Вопрос пользователя:
+{user_question}
+""".strip()
+
+        messages = [
+            ChatMessage(role="system", content=final_system_prompt),
+            ChatMessage(role="user", content=final_user_prompt),
+        ]
+
+        response = Settings.llm.chat(messages)
+        return response.message.content
+
+    except Exception as e:
+        print(f"Ошибка агента НПА: {e}")
+        return f"Ошибка при обработке запроса по нормативным документам: {str(e)}"
+
 # === Статистический агент ===
 def get_db_connection():
     return psycopg2.connect(**PSYCOPG_DB_PARAMS)
@@ -642,7 +828,7 @@ def get_top_similar_indicators(user_question: str, top_k: int = 30) -> tuple[pd.
 def format_statistics_context(user_question: str) -> str:
     metadata = get_statistics_metadata(statistics_cache_key())
 
-    matched_territories_df, top_indicators_df = get_top_similar_indicators(user_question, top_k=30)
+    matched_territories_df, top_indicators_df = get_top_similar_indicators(user_question, top_k=15)
     print("\n--- TOP SIMILAR TERRITORIES ---")
     for _, row in matched_territories_df.iterrows():
         print(f"{row['similarity']:.2f} | {row['territory_name']}")
@@ -655,7 +841,7 @@ def format_statistics_context(user_question: str) -> str:
     indicators_lines = []
     for _, row in top_indicators_df.iterrows():
         indicators_lines.append(
-            f"- {row['indicator_name']} | секция: {row['section_name']} | единица: {row['unit_name']} | категория: {row['industry_name']} | similarity: {row['similarity']:.4f}"
+            f"- Полное название индикатора: {row['indicator_name']}"
         )
 
     territories_lines = []
@@ -805,7 +991,7 @@ def classify_query_tool(user_question: str, conversation_history: str = None) ->
         ]
         response = Settings.llm.chat(messages)
         query_type = response.message.content.strip().lower()
-        return query_type if query_type in ["rag", "dialog", "statistics"] else "dialog"
+        return query_type if query_type in ["rag", "dialog", "statistics", "npa"] else "dialog"
     except Exception as e:
         print(f"Ошибка классификации: {e}")
         return "dialog"
@@ -899,7 +1085,9 @@ def process_query_simple(user_question: str, context_history: str = None) -> str
     if query_type == "statistics":
         print("Запуск статистического агента...")
         return generate_statistics_response(user_question, conversation_history=context_history)
-
+    if query_type == "npa":
+        print("Запуск агента по НПА и методическим рекомендациям...")
+        return generate_npa_response(user_question, conversation_history=context_history)
     print("Запуск диалогового режима...")
     return generate_dialog_response(user_question, conversation_history=context_history)
 
