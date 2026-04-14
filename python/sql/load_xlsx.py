@@ -27,9 +27,9 @@
   --dry-run   только показать, что будет найдено, без записи в БД
 """
 from __future__ import annotations
-
+# менять названия территорий и файла
 XLSX_PATH = r"vagaisky.xlsx"
-TERRITORY_NAME = "Вагайский район"
+TERRITORY_NAME = "Вагайский муниципальный район"
 DB_CONFIG = {
     "host": "127.0.0.1",
     "port": 5433,

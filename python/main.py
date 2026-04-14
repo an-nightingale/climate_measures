@@ -37,6 +37,14 @@ _rebuild_lock = threading.Lock()
 TABLE_NAME = "climate_embeddings"
 NPA_XLSX_PATH = "./data/нпа.xlsx"
 METHOD_XLSX_PATH = "./data/методрекомендации.xlsx"
+FLOOD_JSON_PATH = "./data/flood_status.json"
+
+
+@lru_cache(maxsize=1)
+def load_flood_data() -> dict:
+    with open(FLOOD_JSON_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
 
 yandex_client = openai.OpenAI(
     api_key=os.getenv("YANDEX_CLOUD_API_KEY"),
@@ -131,14 +139,64 @@ NPA_SYSTEM_PROMPT = """
 - Пиши полный ответ, но не слишком много. Выбирай самое важное.
 """
 
+FLOOD_SECTION_SELECTOR_PROMPT = """
+Ты выбираешь, какие разделы JSON с паводковой информацией нужны для ответа на вопрос пользователя.
+
+Доступные разделы:
+- Перекрытие дорог
+- Открытые дороги
+- Пункты сбора гуманитарной помощи
+- Пункты временного размещения
+- Пункты вакцинации против гепатита А
+- Гидропосты
+
+Правила:
+1. Выбери только те разделы, которые реально нужны для ответа.
+2. Если вопрос про перекрытые дороги, подтопление дорог, дороги в зоне подтопления, перекрытия, объезды, проезд — обычно нужен раздел:
+   - Перекрытие дорог
+3. Если вопрос про размещение людей — нужен раздел:
+   - Пункты временного размещения
+4. Если вопрос про гуманитарную помощь — нужен раздел:
+   - Пункты сбора гуманитарной помощи
+5. Если вопрос про вакцинацию или гепатит А — нужен раздел:
+   - Пункты вакцинации против гепатита А
+6. Если вопрос про уровень воды, гидрологическую обстановку, динамику воды — нужен раздел:
+   - Гидропосты
+7. Если вопрос про недавно открытые дороги (уже не перекрытые) - нужен раздел:
+   - Открытые дороги
+7. Можно выбрать несколько разделов.
+8. Не выдумывай новые разделы.
+9. Верни только JSON-массив строк, без пояснений.
+
+Пример ответа:
+["Пункты временного размещения", "Пункты сбора гуманитарной помощи"]
+"""
+
+FLOOD_SYSTEM_PROMPT = """
+Ты — ассистент по текущей паводковой обстановке в Тюменской области.
+
+Тебе передаются:
+1. Вопрос пользователя
+2. Релевантные разделы JSON с текущими паводковыми данными
+
+Правила:
+- Отвечай только по переданному контексту.
+- Не выдумывай объекты, дороги, ПВР, гидропосты, маршруты, адреса.
+- Используй все доступные поля объектов в ответе.
+- Используй все поля. Используй содержимое полей полностью.
+- Названия полей в properties (Муниципальное образование, Населенный пункт и т.д.) также полностью используй в своем ответе. Структурируй ответ по полям.
+- Если есть в информации об объекте - обязательно прикладывай ссылку на объект на карте (map_url, в ссылке нет слова text)
+- Пиши кратко, структурированно, списками. Каждый объект - новый элемент списка. Не используй таблицы! Не пиши примечания.
+"""
+
 CLASSIFIER_SYSTEM_PROMPT = """
 Ты — классификатор запросов. Твоя задача — определить тип запроса пользователя.
 Доступные типы:
 - "rag" — запросы, требующие поиска в базе знаний, напрямую связанные с адаптационными мероприятиями для конкретных регионов. Могут быть либо прямыми запросами на составление адаптационных мероприятий, либо описанием существующего климатического риска с просьбой составить адаптационные мероприятия или без просьбы.
-- "dialog" — прочие вопросы, не требующие поиска в базе знаний, в том числе общие вопросы про климатические риски.
 - "statistics" — запросы на получение статистики из базы данных по районам, периодам, показателям и единицам измерения.
 - "npa" — запросы про нормативные документы, ГОСТы, СП, приказы, постановления, распоряжения, методические рекомендации, регламенты, инструкции, правила и порядок действий.
-
+- "flood" — запросы про актуальные на данный момент перекрытые и открытые дороги, пути объезда, гидропосты, ПВР, пункты гуманитарной помощи, пункты вакцинации.
+- "dialog" — прочие вопросы, не требующие поиска в базе знаний или текущей статистике, в том числе общие вопросы про климатические риски, адаптацию, вопросы про прогнозы и т.д.
 Примеры классификации:
 Запрос: "Какие меры по адаптации к засухе для Ялуторовского района?"
 Тип: rag
@@ -179,11 +237,17 @@ CLASSIFIER_SYSTEM_PROMPT = """
 Запрос: "Есть ли методические рекомендации по адаптации к климатическим рискам?"
 Тип: npa
 
+Запрос: "Какие дороги могут оказаться в зоне подтопления? Существуют ли пути объезда?"
+Тип: flood
+
+Запрос: "Какие есть пункты временного размещения?"
+Тип: flood
+
 ВАЖНО: Если во входных данных есть "История диалога", учитывай её. 
 Если пользователь ссылается на предыдущий ответ, который относится к типу rag (например, "добавь ещё меры к таблице выше"), это тип "rag".
 Если пользователь ссылается на предыдущий статистический ответ, просит продолжить, уточнить, сравнить или вывести похожий показатель — это тип "statistics".
 Если пользователь просто благодарит или задает вопрос на новую тему  — "dialog".
-Отвечай ТОЛЬКО одним словом: "rag", "dialog", "statistics" или "npa". Не добавляй никаких пояснений.
+Отвечай ТОЛЬКО одним словом: "rag", "dialog", "statistics", "npa" или "flood". Не добавляй никаких пояснений.
 """
 STATISTICS_SQL_SYSTEM_PROMPT = """
 Ты — эксперт по PostgreSQL и аналитике статистических данных.
@@ -500,6 +564,117 @@ def generate_dialog_response(user_question: str, conversation_history: str = Non
         return f"Ошибка при обработке запроса: {str(e)}"
 
 
+# паводковый агент
+def select_flood_sections_with_llm(user_question: str, conversation_history: str = None) -> list[str]:
+    data = load_flood_data()
+    available_sections = list(data.get("sections", {}).keys())
+
+    history_block = f"\n\nИстория диалога:\n{conversation_history}" if conversation_history else ""
+
+    messages = [
+        ChatMessage(role="system", content=FLOOD_SECTION_SELECTOR_PROMPT),
+        ChatMessage(
+            role="user",
+            content=(
+                    f"Доступные разделы:\n"
+                    + "\n".join(f"- {s}" for s in available_sections)
+                    + f"{history_block}\n\n"
+                      f"Вопрос пользователя:\n{user_question}\n\n"
+                      f"Верни JSON-массив названий разделов."
+            ),
+        ),
+    ]
+
+    response = Settings.llm.chat(messages)
+    raw = response.message.content.strip()
+
+    try:
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        selected = json.loads(raw)
+
+        if isinstance(selected, list):
+            selected = [str(x).strip() for x in selected if str(x).strip() in available_sections]
+            if selected:
+                return selected
+    except Exception:
+        pass
+
+    # fallback: если модель вернула что-то не то — отдаем все разделы
+    return available_sections
+
+
+def build_full_flood_context_for_sections(selected_sections: list[str]) -> str:
+    data = load_flood_data()
+
+    lines = []
+    lines.append(f"Источник данных: {data.get('source_url', '')}")
+    lines.append(f"Ссылка на карту: {data.get('map_url', '')}")
+    lines.append(f"Дата обновления: {data.get('parsed_at', '')}")
+    lines.append(f"Выбранные разделы: {', '.join(selected_sections)}")
+    lines.append("")
+
+    for section_name in selected_sections:
+        section_block = data.get("sections", {}).get(section_name, {})
+        items = section_block.get("items", [])
+
+        lines.append(f"===== РАЗДЕЛ: {section_name} =====")
+        lines.append(f"URL раздела: {section_block.get('url', '')}")
+        lines.append(f"Количество объектов: {section_block.get('count', 0)}")
+        lines.append("")
+
+        for idx, item in enumerate(items, start=1):
+            lines.append(f"--- ОБЪЕКТ {idx} ---")
+
+            # все верхнеуровневые поля объекта, кроме properties чтобы не дублировать
+            for key, value in item.items():
+                if key == "properties":
+                    continue
+                lines.append(f"{key}: {value}")
+
+            props = item.get("properties", {})
+            if isinstance(props, dict):
+                lines.append("properties:")
+                for pk, pv in props.items():
+                    lines.append(f"  {pk}: {pv}")
+
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+def generate_flood_response(user_question: str, conversation_history: str = None) -> str:
+    try:
+        selected_sections = select_flood_sections_with_llm(
+            user_question,
+            conversation_history=conversation_history
+        )
+
+        flood_context = build_full_flood_context_for_sections(selected_sections)
+
+        history_instruction = ""
+        if conversation_history:
+            history_instruction = f"\n\nИстория диалога:\n{conversation_history}"
+
+        messages = [
+            ChatMessage(role="system", content=FLOOD_SYSTEM_PROMPT),
+            ChatMessage(
+                role="user",
+                content=(
+                    f"{history_instruction}\n\n"
+                    f"Контекст по паводковой обстановке:\n{flood_context}\n\n"
+                    f"Вопрос пользователя:\n{user_question}"
+                ),
+            ),
+        ]
+
+        response = Settings.llm.chat(messages)
+        return response.message.content
+
+    except Exception as e:
+        print(f"Ошибка flood-агента: {e}")
+        return f"Ошибка при обработке запроса по паводковой обстановке: {str(e)}"
+
+
 # нормативный агент
 @lru_cache(maxsize=1)
 def load_npa_context() -> str:
@@ -638,6 +813,7 @@ def generate_npa_response(user_question: str, conversation_history: str = None) 
     except Exception as e:
         print(f"Ошибка агента НПА: {e}")
         return f"Ошибка при обработке запроса по нормативным документам: {str(e)}"
+
 
 # === Статистический агент ===
 def get_db_connection():
@@ -991,7 +1167,7 @@ def classify_query_tool(user_question: str, conversation_history: str = None) ->
         ]
         response = Settings.llm.chat(messages)
         query_type = response.message.content.strip().lower()
-        return query_type if query_type in ["rag", "dialog", "statistics", "npa"] else "dialog"
+        return query_type if query_type in ["rag", "dialog", "statistics", "npa", "flood"] else "dialog"
     except Exception as e:
         print(f"Ошибка классификации: {e}")
         return "dialog"
@@ -1088,6 +1264,9 @@ def process_query_simple(user_question: str, context_history: str = None) -> str
     if query_type == "npa":
         print("Запуск агента по НПА и методическим рекомендациям...")
         return generate_npa_response(user_question, conversation_history=context_history)
+    if query_type == "flood":
+        print("Запуск flood-агента...")
+        return generate_flood_response(user_question, conversation_history=context_history)
     print("Запуск диалогового режима...")
     return generate_dialog_response(user_question, conversation_history=context_history)
 
