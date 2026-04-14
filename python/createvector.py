@@ -6,6 +6,9 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.core import Settings
 from llama_index.core.node_parser import SentenceSplitter
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 def read_excel_as_documents(file_path: str):
@@ -76,7 +79,7 @@ def create_vector_index(data_path: str = "./data"):
         port=os.getenv("DB_PORT"),
         user=os.getenv("DB_USERNAME"),
         table_name="climate_embeddings",
-        embed_dim=1024,
+        embed_dim=os.getenv("EMBED_DIM"),
         hnsw_kwargs={
             "hnsw_m": 16,
             "hnsw_ef_construction": 64,
